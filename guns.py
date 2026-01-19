@@ -1,5 +1,5 @@
 class guns(object):
-    def __init__(self, name, effective_range, rate_of_fire, magazine_capacity,ammo_given,sprite,distancefactor=1.0):
+    def __init__(self, name, effective_range, rate_of_fire, magazine_capacity,ammo_given,sprite,distancefactor=1.0, harm=False):
         self.name = name
         self.distancefactor = distancefactor   # multiplier for effective range
         self.effective_range = effective_range  # in meters
@@ -8,6 +8,7 @@ class guns(object):
         self.current_ammo = magazine_capacity  # starts full
         self.ammo_given = ammo_given  # total ammo given
         self.sprite = sprite  # visual representation
+        self.harm = harm  # damage potential
         
     def display_info(self):
         info = f"Gun Name: {self.name}\n"
@@ -18,3 +19,4 @@ class guns(object):
         info += f"Ammo Given: {self.ammo_given}\n"
         info += f"Sprite: {self.sprite}\n"
         return info
+    
