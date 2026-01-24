@@ -56,8 +56,6 @@ class Gun(object):
         
 guns = []
 
-guns.append(Gun("AA-20 Shotgun", 8, 6, 2, 40, 5, 480, False, 0.45, 6, 42, "gunsprites/Shotgun.png"))
-
 guns.append(Gun("AK47", 10, 4, 2, 30, 1, 800, False, 0.1, 35, 250, "ak47.png"))
 
 guns.append(Gun("Desert Eagle", 8, 2, 1.25, 15, 1, 500, False, 0.25, 15, 75, "deagle.png"))
@@ -78,7 +76,7 @@ guns.append(Gun("UZI", 7, 6, 1.5, 20, 1, 500, True, 0.1, 40, 400, "uzi.png"))
 
 guns.append(Gun("TEC9", 10, 4, 1.5, 25, 1, 600, True, 0.15, 40, 400, "tec9.png"))
 
-guns.append(Gun("SPAS-12", 25, 10, 2.5, 40, 5, 325, False, 0.75, 5, 24, "spas12.png"))
+guns.append(Gun("SPAS-12", 25, 10, 2.5, 40, 5, 325, False, 0.75, 5, 24, "Shotgun.png"))
 
 guns.append(Gun("SMAW", 1, 0, 4, 35, 1, 1, False, 1.25, 3, 6, "smaw.png"))
 
@@ -87,3 +85,6 @@ guns.append(Gun("TAVOR", 9, 2, 1.5, 30, 1, 750, False, 0.12, 35, 200, "tavor.png
 guns.append(Gun("XM8", 8, 3.25, 1.9, 30, 1, 875, False, 0.085, 30, 200, "xm8.png"))
 
 guns.append(Gun("MINIGUN", 30, 7, 4.25, 35, 1, 650, False, 0.08, 50, 200, "minigun.png"))
+
+for gun in guns:
+    print(gun.display_info())
