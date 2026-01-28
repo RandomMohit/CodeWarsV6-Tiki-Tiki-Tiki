@@ -5,12 +5,17 @@ import time
 
 class PlayerClient:
     def __init__(self, W=800, H=600):
-        self.screen = pygame.display.set_mode((W, H))
+        # Initial screen size, will be resized after connecting to server
+        self.screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
         pygame.display.set_caption("PyTanks")
         self.font = pygame.font.SysFont(None, 24)
 
         self.get_player_name()
         self.join_server()
+        # Resize screen based on map dimensions
+        map_width = self.grid_w * self.grid_size
+        map_height = self.grid_h * self.grid_size
+        self.screen = pygame.display.set_mode((map_width, map_height), pygame.RESIZABLE)
         self.run_game()
         self.quit_game()
 
@@ -80,9 +85,9 @@ class PlayerClient:
             if i == self.ID:
                     color = (0, 0, 255)
             # Draw player circle
-            pygame.draw.circle(self.screen, color, (int(game_world[i, 1]), int(game_world[i, 2])), 25)
+            pygame.draw.circle(self.screen, color, (int(game_world[i, 1]), int(game_world[i, 2])), 12.5)
             # Draw aim direction line
-            pygame.draw.line(self.screen, (0, 255, 0), ((int(game_world[i, 1]), int(game_world[i, 2]))), ((int(game_world[i, 1] + 25*np.cos(game_world[i, 3])), int(game_world[i, 2] + 25*np.sin(game_world[i, 3])))), 2)
+            pygame.draw.line(self.screen, (0, 255, 0), ((int(game_world[i, 1]), int(game_world[i, 2]))), ((int(game_world[i, 1] + 12.5*np.cos(game_world[i, 3])), int(game_world[i, 2] + 12.5*np.sin(game_world[i, 3])))), 2)
             
             # Draw jetpack indicator (orange dot below player when fuel is being used)
             # If fuel is decreasing (not at max), show jetpack is active

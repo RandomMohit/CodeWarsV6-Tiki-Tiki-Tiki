@@ -3,6 +3,7 @@ import threading
 import time
 import numpy as np
 import pygame
+import os
 
 class Server:
     def __init__(self):
@@ -58,8 +59,8 @@ class Server:
         # screen and tank constants for ground handling
         self.SCREEN_W = 800
         self.SCREEN_H = 600
-        self.TANK_RADIUS = 15  # visual radius
-        self.COLLISION_RADIUS = 12  # smaller collision radius to prevent getting stuck
+        self.TANK_RADIUS = 7.5  # visual radius
+        self.COLLISION_RADIUS = 6  # smaller collision radius to prevent getting stuck
         self.GROUND_Y = self.SCREEN_H - self.COLLISION_RADIUS
         self.GRAVITY = 0.8
         
@@ -86,28 +87,56 @@ class Server:
         self.FIRE_COOLDOWN = 10  # 10 frames = ~167ms at 60fps
         self.player_fire_cooldown = np.zeros(8, dtype=np.int32)
         
+        # Fire rate cooldown (frames between shots)
+        self.FIRE_COOLDOWN = 10  # 10 frames = ~167ms at 60fps
+        self.player_fire_cooldown = np.zeros(8, dtype=np.int32)
+        
         # Collision map system - grid-based obstacles
-        self.GRID_SIZE = 20  # each cell is 20x20 pixels
-        self.GRID_W = self.SCREEN_W // self.GRID_SIZE  # 40 cells wide
-        self.GRID_H = self.SCREEN_H // self.GRID_SIZE  # 30 cells tall
+        self.GRID_SIZE = 10  # each cell is 10x10 pixels (matches map editor)
         
-        # Create default map (1=passable, 0=obstacle)
-        self.collision_map = np.ones((self.GRID_H, self.GRID_W), dtype=np.int32)
+        # Load map from file - this will set GRID_W, GRID_H, and collision_map
+        self.load_map("catacombs")
         
-        # Example map: add some platforms and obstacles
-        # Ground floor
-        self.collision_map[-1, :] = 0  # bottom row is solid
-        
-        # Platforms
-        self.collision_map[20, 5:15] = 0  # platform 1
-        self.collision_map[15, 25:35] = 0  # platform 2
-        self.collision_map[10, 10:20] = 0  # platform 3
-        
-        # Walls
-        self.collision_map[5:25, 20] = 0  # vertical wall
+        # Update screen dimensions based on loaded map
+        self.SCREEN_W = self.GRID_W * self.GRID_SIZE
+        self.SCREEN_H = self.GRID_H * self.GRID_SIZE
         
         # Convert map to bytes for transmission
         self.collision_map_bytes = self.collision_map.tobytes()
+    
+    def load_map(self, map_name):
+        """Load map from maps/ folder or create default if not found"""
+        map_path = os.path.join("maps", f"{map_name}.npy")
+        
+        if os.path.exists(map_path):
+            try:
+                self.collision_map = np.load(map_path)
+                # Extract dimensions from loaded map
+                self.GRID_H, self.GRID_W = self.collision_map.shape
+                print(f"[SERVER] Loaded map: {map_name} (dimensions: {self.GRID_W}x{self.GRID_H})")
+                return True
+            except Exception as e:
+                print(f"[SERVER] Error loading map {map_name}: {e}")
+        
+        # Create default map if file not found
+        print(f"[SERVER] Map '{map_name}' not found, creating default map")
+        # Use default dimensions if not already set
+        if not hasattr(self, 'GRID_W'):
+            self.GRID_W = 80
+            self.GRID_H = 60
+        
+        self.collision_map = np.ones((self.GRID_H, self.GRID_W), dtype=np.int32)
+        
+        # Simple default layout
+        self.collision_map[-1, :] = 0  # Ground floor
+        if self.GRID_H > 20:
+            self.collision_map[20, 5:min(15, self.GRID_W)] = 0  # Left platform
+        if self.GRID_H > 15:
+            self.collision_map[15, 25:min(35, self.GRID_W)] = 0  # Right platform
+        if self.GRID_H > 10:
+            self.collision_map[10, 10:min(20, self.GRID_W)] = 0  # Top platform
+        
+        return False
     
     def is_colliding_with_obstacle(self, x, y, radius):
         """Check if a circle at (x, y) with given radius collides with any obstacle"""
@@ -247,11 +276,39 @@ class Server:
             # clamp vertical position to prevent going too far up
             self.world_data[:8, 2] = np.clip(self.world_data[:8, 2], self.TANK_RADIUS, self.SCREEN_H)
 
-            self.world_data[8:, 1] += np.cos(self.world_data[8:, 3]) * self.world_data[8:, 4]
-            self.world_data[8:, 2] += np.sin(self.world_data[8:, 3]) * self.world_data[8:, 4]
+            # Move bullets and check collisions
+            for b in range(8, 48):
+                if self.world_data[b, 0] == 1:  # if bullet is active
+                    # Store old position
+                    old_x, old_y = self.world_data[b, 1], self.world_data[b, 2]
+                    
+                    # Move bullet
+                    self.world_data[b, 1] += np.cos(self.world_data[b, 3]) * self.world_data[b, 4]
+                    self.world_data[b, 2] += np.sin(self.world_data[b, 3]) * self.world_data[b, 4]
+                    
+                    # Update distance traveled
+                    self.world_data[b, 5] += self.world_data[b, 4]
+                    
+                    # Check if bullet hit obstacle (only if it has moved from spawn)
+                    if self.world_data[b, 5] > self.world_data[b, 4]:  # traveled more than one step
+                        new_x, new_y = self.world_data[b, 1], self.world_data[b, 2]
+                        
+                        # Check multiple points along the path
+                        steps = 5
+                        hit = False
+                        for i in range(steps + 1):
+                            t = i / steps
+                            check_x = old_x + (new_x - old_x) * t
+                            check_y = old_y + (new_y - old_y) * t
+                            if self.is_colliding_with_obstacle(check_x, check_y, 2):
+                                hit = True
+                                break
+                        
+                        if hit:
+                            self.world_data[b, 0] = 0  # deactivate bullet
 
-            self.world_data[8:, 5] += self.world_data[8:, 4] * self.world_data[8:, 0]
-            self.world_data[8:, 0] = np.where(self.world_data[8:, 5] > MAX_BULLET_DIST, 0, 1)
+            # Deactivate bullets that traveled too far
+            self.world_data[8:, 0] = np.where(self.world_data[8:, 5] > MAX_BULLET_DIST, 0, self.world_data[8:, 0])
 
             # create bullets (space = index 7)
             shooting_id = np.where(self.player_inputs[:, 7] == 1)[0]
@@ -265,8 +322,8 @@ class Server:
                 if len(free_slots) > 0:
                     bullet_index = free_slots[0]
                     self.world_data[id+bullet_index, 0] = 1
-                    self.world_data[id+bullet_index, 1] = self.world_data[idx, 1] + np.cos(self.world_data[idx, 3]) * 30
-                    self.world_data[id+bullet_index, 2] = self.world_data[idx, 2] + np.sin(self.world_data[idx, 3]) * 30
+                    self.world_data[id+bullet_index, 1] = self.world_data[idx, 1] + np.cos(self.world_data[idx, 3]) * 15
+                    self.world_data[id+bullet_index, 2] = self.world_data[idx, 2] + np.sin(self.world_data[idx, 3]) * 15
                     self.world_data[id+bullet_index, 3] = self.world_data[idx, 3]
                     # reset traveled distance
                     self.world_data[id+bullet_index, 5] = 0
