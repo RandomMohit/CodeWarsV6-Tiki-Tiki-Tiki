@@ -4,6 +4,10 @@ import time
 import numpy as np
 import pygame
 import os
+from copy import deepcopy
+from scripts.guns.guns import Gun, GUN_DATA
+
+guns=[[Gun(**data) for data in GUN_DATA]]
 
 class Server:
     def __init__(self):
@@ -21,32 +25,34 @@ class Server:
     def _start_server(self, PORT):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        HOST_NAME = socket.gethostname()
-        SERVER_IP = socket.gethostbyname(HOST_NAME)
-
+        SERVER_IP = "0.0.0.0"   # 👈 listen on ALL interfaces
         try:
             self.server_socket.bind((SERVER_IP, PORT))
         except socket.error as e:
             print(str(e))
             print("[SERVER] Server could not start")
             return False
-
         self.server_socket.listen()
-
-        print(f"[SERVER] Server Started with local ip {SERVER_IP}")
+        print(f"[SERVER] Server Started on port {PORT}")
         return True
+
 
     def setup_game(self):
         self.player_count = 0
 
-        # world_data columns (per row):
-        # 0:is_alive, 1:x, 2:y, 3:theta, 4:v, 5:omega_or_traveled, 6:fuel, 7:health_or_damage, 8:score, 9:owner_id
-        # for tanks: column 6 = fuel, 7 = health, 8 = score
-        # for bullets: column 5 = distance traveled, 7 = damage, 9 = owner id
-        self.world_data = np.zeros((48, 10), dtype=np.float64)
-        self.player_inputs = np.zeros((8, 8), dtype=np.int32)  # 8 inputs now
+        # ---- PLAYER STATE ----
+        self.player_gun_id = np.zeros(8, dtype=np.int32)
+        self.player_guns = [None] * 8   # filled when players join
 
+        # ---- WORLD DATA ----
+        # columns:
+        # 0:is_alive, 1:x, 2:y, 3:theta, 4:v, 5:omega_or_traveled,
+        # 6:fuel, 7:health_or_damage, 8:score, 9:owner_id, 10:gun_id
+        self.world_data = np.zeros((48, 11), dtype=np.float64)
+   
+        self.player_inputs = np.zeros((8, 8), dtype=np.int32)
+
+          # ---- MOVEMENT CONSTANTS ----
         TANK_V = 3.0
         TANK_OMEGA = 0.04
         BULLET_V = 10.0
@@ -54,55 +60,35 @@ class Server:
         self.world_data[:8, 4] = TANK_V
         self.world_data[:8, 5] = TANK_OMEGA
         self.world_data[8:, 4] = BULLET_V
-        # per-player vertical velocity for gravity (tanks only)
+
+        # ---- PHYSICS ----
         self.player_vy = np.zeros(8, dtype=np.float64)
-        # screen and tank constants for ground handling
-        self.SCREEN_W = 800
-        self.SCREEN_H = 600
-        self.TANK_RADIUS = 7.5  # visual radius
-        self.COLLISION_RADIUS = 6  # smaller collision radius to prevent getting stuck
-        self.GROUND_Y = self.SCREEN_H - self.COLLISION_RADIUS
+ 
+        self.TANK_RADIUS = 7.5
+        self.COLLISION_RADIUS = 6
         self.GRAVITY = 0.8
-        
-        # Jetpack system
-        self.player_fuel = np.full(8, 100.0, dtype=np.float64)  # start with full fuel
+
+      
+        # ---- JETPACK ----
+        self.JETPACK_THRUST = 1.2   
+        self.FUEL_CONSUMPTION = 0.5
+        self.FUEL_RECHARGE = 0.2
         self.MAX_FUEL = 100.0
-        self.FUEL_CONSUMPTION = 0.5  # fuel consumed per frame when jetpack active
-        self.FUEL_RECHARGE = 0.5     # fuel recharged per frame when not in use
-        self.JETPACK_THRUST = 0.9    # upward velocity applied by jetpack (reduced for better control)
+        self.player_fuel = np.full(8, self.MAX_FUEL, dtype=np.float64)
         
-        # Use column 6 (info) to store fuel for tanks
-        self.world_data[:8, 6] = self.player_fuel
 
-        # Health and score per tank
+    
         self.MAX_HEALTH = 200.0
-        self.world_data[:8, 7] = self.MAX_HEALTH  # health
-        self.world_data[:8, 8] = 0.0  # score
+        self.world_data[:8, 7] = self.MAX_HEALTH
+        self.world_data[:8, 8] = 0.0
 
-        # per-player gun damage (can be changed later when switching weapons)
-        # damage is absolute hit points (default 10 = 10% of 100)
-        self.player_gun_damage = np.full(8, 10.0, dtype=np.float64)
-        
-        # Fire rate cooldown (frames between shots)
-        self.FIRE_COOLDOWN = 10  # 10 frames = ~167ms at 60fps
-        self.player_fire_cooldown = np.zeros(8, dtype=np.int32)
-        
-        # Fire rate cooldown (frames between shots)
-        self.FIRE_COOLDOWN = 10  # 10 frames = ~167ms at 60fps
-        self.player_fire_cooldown = np.zeros(8, dtype=np.int32)
-        
-        # Collision map system - grid-based obstacles
-        self.GRID_SIZE = 10  # each cell is 10x10 pixels (matches map editor)
-        
-        # Load map from file - this will set GRID_W, GRID_H, and collision_map
+        self.GRID_SIZE = 10
         self.load_map("catacombs")
-        
-        # Update screen dimensions based on loaded map
+
         self.SCREEN_W = self.GRID_W * self.GRID_SIZE
         self.SCREEN_H = self.GRID_H * self.GRID_SIZE
-        
-        # Convert map to bytes for transmission
         self.collision_map_bytes = self.collision_map.tobytes()
+
     
     def load_map(self, map_name):
         """Load map from maps/ folder or create default if not found"""
@@ -211,6 +197,10 @@ class Server:
             # Aim control using all 4 arrow keys for continuous rotation
             # UP=3, DOWN=4, LEFT=5, RIGHT=6
             AIM_ROTATION_SPEED = 0.08  # radians per frame
+            for pid in range(8):
+                if self.world_data[pid, 0] == 1:
+                    self.world_data[pid, 10] = self.player_gun_id[pid]
+
             
             for i in range(8):
                 if self.world_data[i, 0] == 0:
@@ -226,20 +216,25 @@ class Server:
                 if self.player_inputs[i, 4] == 1:  # DOWN arrow
                     self.world_data[i, 3] += AIM_ROTATION_SPEED
 
-            # Jetpack system (W key = keyboard_input[0])
-            jetpack_active = self.player_inputs[:, 0].astype(bool)
+            #JETPACK LOGIC
             for i in range(8):
-                if self.world_data[i, 0] == 0:  # skip inactive players
+                if self.world_data[i, 0] == 0:
                     continue
-                if jetpack_active[i] and self.player_fuel[i] > 0:
+                
+                if self.player_inputs[i, 7] == 1 and self.player_fuel[i] > 0:
                     # Apply upward thrust
                     self.player_vy[i] -= self.JETPACK_THRUST
                     # Consume fuel
-                    self.player_fuel[i] = max(0, self.player_fuel[i] - self.FUEL_CONSUMPTION)
+                    self.player_fuel[i] -= self.FUEL_CONSUMPTION
+                    if self.player_fuel[i] < 0:
+                        self.player_fuel[i] = 0
                 else:
                     # Recharge fuel when not using jetpack
-                    self.player_fuel[i] = min(self.MAX_FUEL, self.player_fuel[i] + self.FUEL_RECHARGE)
-                # Update fuel in world_data
+                    self.player_fuel[i] += self.FUEL_RECHARGE
+                    if self.player_fuel[i] > self.MAX_FUEL:
+                        self.player_fuel[i] = self.MAX_FUEL
+                
+                # Update fuel in world data for client sync
                 self.world_data[i, 6] = self.player_fuel[i]
 
             # Apply gravity and vertical movement with obstacle collision
@@ -310,32 +305,32 @@ class Server:
             # Deactivate bullets that traveled too far
             self.world_data[8:, 0] = np.where(self.world_data[8:, 5] > MAX_BULLET_DIST, 0, self.world_data[8:, 0])
 
-            # create bullets (space = index 7)
-            shooting_id = np.where(self.player_inputs[:, 7] == 1)[0]
-            for idx in shooting_id:
-                # Check fire cooldown
-                if self.player_fire_cooldown[idx] > 0:
-                    continue
-                    
-                id = idx * 5 + 8
-                free_slots = np.where(self.world_data[id:id+5, 0] == 0)[0]
-                if len(free_slots) > 0:
-                    bullet_index = free_slots[0]
-                    self.world_data[id+bullet_index, 0] = 1
-                    self.world_data[id+bullet_index, 1] = self.world_data[idx, 1] + np.cos(self.world_data[idx, 3]) * 15
-                    self.world_data[id+bullet_index, 2] = self.world_data[idx, 2] + np.sin(self.world_data[idx, 3]) * 15
-                    self.world_data[id+bullet_index, 3] = self.world_data[idx, 3]
-                    # reset traveled distance
-                    self.world_data[id+bullet_index, 5] = 0
-                    # set bullet damage from player's current gun
-                    self.world_data[id+bullet_index, 7] = self.player_gun_damage[idx]
-                    # set bullet owner for scoring
-                    self.world_data[id+bullet_index, 9] = idx
-                    # Set cooldown
-                    self.player_fire_cooldown[idx] = self.FIRE_COOLDOWN
-            
-            # Decrease all cooldowns
-            self.player_fire_cooldown = np.maximum(0, self.player_fire_cooldown - 1)
+    
+            dt = 1 / 60.0
+
+            for pid in range(8):
+               if self.world_data[pid, 0] == 0:
+                   continue
+            gun = self.player_guns[pid]
+            if gun is None:
+                continue
+
+            # update gun cooldown
+            gun.update(dt)
+
+    # client intent: SPACE
+            if self.player_inputs[pid, 7] != 1:
+                continue
+
+            bullets = gun.shoot(
+                 self.world_data[pid, 1],  # x
+                 self.world_data[pid, 2],  # y
+                 self.world_data[pid, 3]   # angle
+                 )
+
+            for bullet in bullets:
+                self._spawn_bullet(pid, bullet)
+
 
             # detect collisions
             # BULLET -> TANK collisions: apply damage, credit score, respawn on death
@@ -389,7 +384,19 @@ class Server:
         # reset health on respawn
         if hasattr(self, 'MAX_HEALTH'):
             self.world_data[tank_index, 7] = self.MAX_HEALTH
-
+    def _spawn_bullet(self, owner_id, bullet):
+        """Find an inactive bullet slot and spawn the bullet there"""
+        for b in range(8, 48):
+            if self.world_data[b, 0] == 0:
+                self.world_data[b, 0] = 1
+                self.world_data[b, 1] = bullet["x"]
+                self.world_data[b, 2] = bullet["y"]
+                self.world_data[b, 3] = np.arctan2(bullet["vy"], bullet["vx"])
+                self.world_data[b, 4] = np.hypot(bullet["vx"], bullet["vy"])
+                self.world_data[b, 5] = 0
+                self.world_data[b, 7] = bullet["damage"]
+                self.world_data[b, 9] = owner_id
+                break
     def add_players(self):
         while True:
             conn, address = self.server_socket.accept()
@@ -409,7 +416,19 @@ class Server:
         name = data.decode("utf-8")
         print("[LOG]", name, "connected to the server.")
 
-        conn.send(str.encode(str(player_id)))
+        conn.sendall(np.int32(player_id).tobytes())
+
+        # assign default gun (e.g. pistol = index 0)
+        default_gun_id = 0
+
+        self.player_gun_id[player_id] = default_gun_id
+        self.player_guns[player_id] = deepcopy(guns[default_gun_id])
+
+        # sync gun id to world_data
+        self.world_data[player_id, 10] = default_gun_id
+
+        self.world_data[player_id, 0] = 1  # alive
+        self.respawn(player_id)
         
         # Send collision map dimensions and data
         map_info = np.array([self.GRID_W, self.GRID_H, self.GRID_SIZE], dtype=np.int32)

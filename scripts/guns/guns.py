@@ -1,6 +1,9 @@
-import time
 import math
+import random
 
+# =========================
+# BULLET FACTORY
+# =========================
 def spawn_bullet(x, y, angle, speed, damage):
     return {
         "x": x,
@@ -11,80 +14,367 @@ def spawn_bullet(x, y, angle, speed, damage):
         "radius": 4
     }
 
-class Gun(object):
-    def __init__(self, name,damage,accuracy,reloadtime,melee, rpf,effective_range,dual_wielding, rate_of_fire, magazine_capacity,ammo_given,sprite,distancefactor=1.0, harm=False):
+
+# =========================
+# GUN CLASS
+# =========================
+class Gun:
+    def __init__(
+        self,
+        name,
+        damage,
+        accuracy,
+        reload_time,
+        melee,
+        rpf,
+        effective_range,
+        dual_wielding,
+        rate_of_fire,
+        magazine_capacity,
+        ammo_given,
+        sprite,
+        distancefactor=1.0,
+        harm=False
+    ):
+        # ---- static properties ----
         self.name = name
-        self.distancefactor = distancefactor   # multiplier for effective range
-        self.effective_range = effective_range  # in meters
-        self.damage=damage  # damage per shot
-        self.rpf=rpf  # rounds per fire
-        self.accuracy=accuracy  # accuracy percentage
-        self.reload_time = reloadtime  # time to reload in seconds
-        self.meleedamage=melee  # melee damage
-        self.rate_of_fire = rate_of_fire  # rounds per minute
-        self.magazine_capacity = magazine_capacity  # number of rounds
-        self.current_ammo = magazine_capacity  # starts full
-        self.ammo_given = ammo_given  # total ammo given
-        self.sprite = sprite  # visual representation
-        self.harm = harm  # damage potential
-        self.dual_wielding = dual_wielding  # can be dual-wielded
-        
-    def display_info(self):
-        info = f"Gun Name: {self.name}\n"
-        info += f"Effective Range: {self.effective_range} meters\n"
-        info += f"Rate of Fire: {self.rate_of_fire} rounds per minute\n"
-        info += f"Magazine Capacity: {self.magazine_capacity}\n"
-        info += f"Current Ammo: {self.current_ammo}\n"
-        info += f"Ammo Given: {self.ammo_given}\n"
-        info += f"Sprite: {self.sprite}\n"
-        return info
-    def reload(self):
-        self.current_ammo = self.magazine_capacity
-        print("Reloading...")
-        time.sleep(self.reload_time)
-        return f"{self.name} reloaded to full capacity."
+        self.damage = damage
+        self.accuracy = accuracy              # degrees
+        self.reload_time = reload_time        # seconds
+        self.melee_damage = melee
+        self.rpf = rpf                        # rounds per fire
+        self.effective_range = effective_range
+        self.dual_wielding = dual_wielding
+        self.rate_of_fire = rate_of_fire      # RPM
+        self.magazine_capacity = magazine_capacity
+        self.ammo_given = ammo_given
+        self.sprite = sprite
+        self.distancefactor = distancefactor
+        self.harm = harm
+
+        # ---- dynamic state ----
+        self.current_ammo = magazine_capacity
+        self.cooldown = 0.0
+        self.reloading = False
+        self.reload_timer = 0.0
+
+    # =========================
+    # UPDATE (CALLED EVERY FRAME)
+    # =========================
+    def update(self, dt):
+        if self.cooldown > 0:
+            self.cooldown = max(0.0, self.cooldown - dt)
+
+        if self.reloading:
+            self.reload_timer -= dt
+            if self.reload_timer <= 0:
+                self.current_ammo = self.magazine_capacity
+                self.reloading = False
+
+    # =========================
+    # START RELOAD
+    # =========================
+    def start_reload(self):
+        if self.reloading:
+            return
+        if self.current_ammo == self.magazine_capacity:
+            return
+        self.reloading = True
+        self.reload_timer = self.reload_time
+
+    # =========================
+    # SHOOT
+    # =========================
     def shoot(self, x, y, angle):
-        if self.current_ammo >= self.rpf:
-            for i in range(self.rpf):
-                bullet = spawn_bullet(x, y, angle, speed=50, damage=self.damage)
-                # Here you would typically add the bullet to a game world or list
-            self.current_ammo -= self.rpf
-            return f"Fired {self.rpf} rounds from {self.name}."
-        else:
-            return "Not enough ammo to shoot."
-        
-        
-guns = []
+        if self.reloading or self.cooldown > 0:
+            return []
 
-guns.append(Gun("AK47", 10, 4, 2, 30, 1, 800, False, 0.1, 35, 250, "ak47.png"))
+        if self.current_ammo < self.rpf:
+            self.start_reload()
+            return []
 
-guns.append(Gun("Desert Eagle", 8, 2, 1.25, 15, 1, 500, False, 0.25, 15, 75, "deagle.png"))
+        bullets = []
 
-guns.append(Gun("Golden Deagle", 10, 2, 1.25, 25, 1, 600, False, 0.2, 15, 75, "gdeagle.png"))
+        for _ in range(self.rpf):
+            spread = math.radians(
+                random.uniform(-self.accuracy, self.accuracy)
+            )
+            bullet_angle = angle + spread
 
-guns.append(Gun("M14", 36, 0, 2.25, 35, 1, 1200, False, 0.55, 6, 36, "m14.png"))
+            bullets.append(
+                spawn_bullet(
+                    x,
+                    y,
+                    bullet_angle,
+                    speed=50,
+                    damage=self.damage
+                )
+            )
 
-guns.append(Gun("M4", 14, 2, 2, 30, 1, 1000, False, 0.5, 24, 300, "m4.png"))
+        self.current_ammo -= self.rpf
+        self.cooldown = 60.0 / self.rate_of_fire
+        return bullets
 
-guns.append(Gun("M93BA Sniper", 75, 0, 2.5, 35, 1, 1500, False, 0.8, 3, 20, "sniper.png"))
+    # =========================
+    # DEBUG / INFO
+    # =========================
+    def display_info(self):
+        return (
+            f"Gun: {self.name}\n"
+            f"Damage: {self.damage}\n"
+            f"Accuracy: {self.accuracy}\n"
+            f"RPM: {self.rate_of_fire}\n"
+            f"Magazine: {self.magazine_capacity}\n"
+            f"Ammo: {self.current_ammo}/{self.magazine_capacity}\n"
+            f"Sprite: {self.sprite}\n"
+        )
 
-guns.append(Gun("Magnum", 30, 1, 2, 25, 1, 650, False, 0.6, 6, 36, "magnum.png"))
 
-guns.append(Gun("MP5", 7, 5, 1.75, 30, 1, 700, True, 0.06, 50, 400, "mp5.png"))
+# =========================
+# DATA-DRIVEN GUN DEFINITIONS
+# =========================
+GUN_DATA = [
 
-guns.append(Gun("UZI", 7, 6, 1.5, 20, 1, 500, True, 0.1, 40, 400, "uzi.png"))
+    # =====================
+    # ASSAULT RIFLES
+    # =====================
+    dict(
+        name="AK47",
+        damage=10,
+        accuracy=4,
+        reload_time=2.0,
+        melee=30,
+        rpf=1,
+        effective_range=800,
+        dual_wielding=False,
+        rate_of_fire=600,
+        magazine_capacity=35,
+        ammo_given=250,
+        sprite="ak47.png"
+    ),
 
-guns.append(Gun("TEC9", 10, 4, 1.5, 25, 1, 600, True, 0.15, 40, 400, "tec9.png"))
+    dict(
+        name="M4",
+        damage=14,
+        accuracy=2,
+        reload_time=2.0,
+        melee=30,
+        rpf=1,
+        effective_range=1000,
+        dual_wielding=False,
+        rate_of_fire=700,
+        magazine_capacity=30,
+        ammo_given=300,
+        sprite="m4.png"
+    ),
 
-guns.append(Gun("SPAS-12", 25, 10, 2.5, 40, 5, 325, False, 0.75, 5, 24, "Shotgun.png"))
+    dict(
+        name="TAVOR",
+        damage=9,
+        accuracy=2,
+        reload_time=1.5,
+        melee=30,
+        rpf=1,
+        effective_range=750,
+        dual_wielding=False,
+        rate_of_fire=650,
+        magazine_capacity=35,
+        ammo_given=200,
+        sprite="tavor.png"
+    ),
 
-guns.append(Gun("SMAW", 1, 0, 4, 35, 1, 1, False, 1.25, 3, 6, "smaw.png"))
+    dict(
+        name="XM8",
+        damage=8,
+        accuracy=3,
+        reload_time=1.9,
+        melee=30,
+        rpf=1,
+        effective_range=875,
+        dual_wielding=False,
+        rate_of_fire=700,
+        magazine_capacity=30,
+        ammo_given=200,
+        sprite="xm8.png"
+    ),
 
-guns.append(Gun("TAVOR", 9, 2, 1.5, 30, 1, 750, False, 0.12, 35, 200, "tavor.png"))
+    # =====================
+    # PISTOLS
+    # =====================
+    dict(
+        name="Desert Eagle",
+        damage=8,
+        accuracy=2,
+        reload_time=1.25,
+        melee=15,
+        rpf=1,
+        effective_range=500,
+        dual_wielding=False,
+        rate_of_fire=240,
+        magazine_capacity=15,
+        ammo_given=75,
+        sprite="deagle.png"
+    ),
 
-guns.append(Gun("XM8", 8, 3.25, 1.9, 30, 1, 875, False, 0.085, 30, 200, "xm8.png"))
+    dict(
+        name="Golden Deagle",
+        damage=10,
+        accuracy=2,
+        reload_time=1.25,
+        melee=25,
+        rpf=1,
+        effective_range=600,
+        dual_wielding=False,
+        rate_of_fire=300,
+        magazine_capacity=15,
+        ammo_given=75,
+        sprite="gdeagle.png"
+    ),
 
-guns.append(Gun("MINIGUN", 30, 7, 4.25, 35, 1, 650, False, 0.08, 50, 200, "minigun.png"))
+    dict(
+        name="Magnum",
+        damage=30,
+        accuracy=1,
+        reload_time=2.0,
+        melee=25,
+        rpf=1,
+        effective_range=650,
+        dual_wielding=False,
+        rate_of_fire=180,
+        magazine_capacity=6,
+        ammo_given=36,
+        sprite="magnum.png"
+    ),
 
-for gun in guns:
-    print(gun.display_info())
+    # =====================
+    # SMGs (DUAL-WIELDABLE)
+    # =====================
+    dict(
+        name="MP5",
+        damage=7,
+        accuracy=5,
+        reload_time=1.75,
+        melee=30,
+        rpf=1,
+        effective_range=700,
+        dual_wielding=True,
+        rate_of_fire=800,
+        magazine_capacity=50,
+        ammo_given=400,
+        sprite="mp5.png"
+    ),
+
+    dict(
+        name="UZI",
+        damage=7,
+        accuracy=6,
+        reload_time=1.5,
+        melee=20,
+        rpf=1,
+        effective_range=500,
+        dual_wielding=True,
+        rate_of_fire=900,
+        magazine_capacity=40,
+        ammo_given=400,
+        sprite="uzi.png"
+    ),
+
+    dict(
+        name="TEC9",
+        damage=10,
+        accuracy=4,
+        reload_time=1.5,
+        melee=25,
+        rpf=1,
+        effective_range=600,
+        dual_wielding=True,
+        rate_of_fire=750,
+        magazine_capacity=40,
+        ammo_given=400,
+        sprite="tec9.png"
+    ),
+
+    # =====================
+    # SHOTGUNS
+    # =====================
+    dict(
+        name="SPAS-12",
+        damage=25,
+        accuracy=10,
+        reload_time=2.5,
+        melee=40,
+        rpf=5,              # pellets per shot
+        effective_range=325,
+        dual_wielding=False,
+        rate_of_fire=80,
+        magazine_capacity=5,
+        ammo_given=24,
+        sprite="shotgun.png"
+    ),
+
+    # =====================
+    # SNIPERS
+    # =====================
+    dict(
+        name="M14",
+        damage=36,
+        accuracy=0.5,
+        reload_time=2.25,
+        melee=35,
+        rpf=1,
+        effective_range=1200,
+        dual_wielding=False,
+        rate_of_fire=180,
+        magazine_capacity=6,
+        ammo_given=36,
+        sprite="m14.png"
+    ),
+
+    dict(
+        name="M93BA Sniper",
+        damage=75,
+        accuracy=0.25,
+        reload_time=2.5,
+        melee=35,
+        rpf=1,
+        effective_range=1500,
+        dual_wielding=False,
+        rate_of_fire=60,
+        magazine_capacity=3,
+        ammo_given=20,
+        sprite="sniper.png"
+    ),
+
+    # =====================
+    # HEAVY / SPECIAL
+    # =====================
+    dict(
+        name="MINIGUN",
+        damage=30,
+        accuracy=7,
+        reload_time=4.25,
+        melee=35,
+        rpf=1,
+        effective_range=650,
+        dual_wielding=False,
+        rate_of_fire=1200,
+        magazine_capacity=50,
+        ammo_given=200,
+        sprite="minigun.png"
+    ),
+
+    dict(
+        name="SMAW",
+        damage=100,
+        accuracy=0,
+        reload_time=4.0,
+        melee=35,
+        rpf=1,
+        effective_range=1,
+        dual_wielding=False,
+        rate_of_fire=30,
+        magazine_capacity=3,
+        ammo_given=6,
+        sprite="smaw.png"
+    ),
+]
