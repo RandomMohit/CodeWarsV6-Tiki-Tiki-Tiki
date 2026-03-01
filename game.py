@@ -6,6 +6,7 @@ from client import Network
 import time
 from weapons import WEAPONS
 from weapon_renderer import WeaponRenderer
+from weapon_effects import WeaponEffectsManager
 import config
 from scripts.bot import Bot
 
@@ -36,8 +37,14 @@ class PlayerClient:
             self.screen = pygame.display.set_mode((map_width, map_height), pygame.RESIZABLE)
 
             self.weapon_renderer = WeaponRenderer()
+            self.effects_manager = WeaponEffectsManager()
             self.bullet_sprite = self.weapon_renderer.load_gun_sprite("bullet.png")
             self.player_weapons = [WEAPONS[1] for _ in range(8)]
+            
+            # Track previous state for effect detection
+            self.prev_shooting = np.zeros(8, dtype=bool)
+            self.prev_bullets = {}
+            self.prev_ammo = {}
 
         self.run_game()
 
@@ -55,6 +62,24 @@ class PlayerClient:
         self.collision_map, self.grid_w, self.grid_h, self.grid_size = self.server.get_collision_map()
         self.running = True
         print("Connected to server, player ID:", self.ID)
+    
+    def _get_barrel_distance(self, weapon_id):
+        """Get distance from player center to gun barrel tip for muzzle flash positioning"""
+        barrel_distances = {
+            1: 35, 2: 35, 6: 36,  # Pistols
+            7: 34, 8: 33, 9: 34,  # SMGs
+            0: 38, 4: 39, 12: 38, 13: 39,  # Assault Rifles
+            3: 42, 5: 45,  # Snipers
+            10: 37, 11: 41, 14: 40,  # Special weapons
+        }
+        return barrel_distances.get(weapon_id, 37)
+    
+    def _get_barrel_offset(self, weapon_id):
+        """Get x,y offset adjustments for specific weapons (in pixels)"""
+        offsets = {
+            8: (6, 4),  # UZI: offset for better positioning
+        }
+        return offsets.get(weapon_id, (0, 0))
 
     def run_game(self):
 
@@ -67,9 +92,10 @@ class PlayerClient:
 
         while self.running:
             if self.render_enabled:
-                clock.tick(config.GAME_FPS)
+                dt = clock.tick(config.GAME_FPS) / 1000.0  # Delta time in seconds
             else: 
                 time.sleep(1 / config.GAME_FPS)
+                dt = 1.0 / config.GAME_FPS
 
             if self.render_enabled:
                 for event in pygame.event.get():
@@ -133,6 +159,44 @@ class PlayerClient:
                     if game_world[i, 0] == 1:  # if player is active
                         self.player_weapons[i].current_ammo = int(game_world[i, 9])
                         self.player_weapons[i].total_ammo = int(game_world[i, 10])
+                
+                # Update visual effects
+                self.effects_manager.update(dt)
+                
+                # Detect muzzle flashes (when ammo decreases = shot fired)
+                for i in range(8):
+                    if game_world[i, 0] == 1:
+                        current_ammo = int(game_world[i, 9])
+                        if i in self.prev_ammo and current_ammo < self.prev_ammo[i]:
+                            # Shot fired! Add muzzle flash
+                            x, y, angle = game_world[i, 1], game_world[i, 2], game_world[i, 3]
+                            weapon_id = self.player_weapons[i].gun_id
+                            
+                            # Calculate muzzle flash position at gun barrel
+                            barrel_dist = self._get_barrel_distance(weapon_id)
+                            offset_x, offset_y = self._get_barrel_offset(weapon_id)
+                            flash_x = x + barrel_dist * np.cos(angle) + offset_x * np.cos(angle + np.pi/2)
+                            flash_y = y + barrel_dist * np.sin(angle) + offset_y * np.sin(angle + np.pi/2)
+                            
+                            self.effects_manager.add_muzzle_flash(flash_x, flash_y, angle, weapon_id)
+                        
+                        self.prev_ammo[i] = current_ammo
+                
+                # Detect bullet impacts (when bullets disappear)
+                active_bullets = {}
+                for b in range(8, 48):
+                    if game_world[b, 0] == 1:
+                        active_bullets[b] = (game_world[b, 1], game_world[b, 2], game_world[b, 9])
+                
+                # Check for bullets that disappeared (impact)
+                for b_id, (prev_x, prev_y, owner_id) in self.prev_bullets.items():
+                    if b_id not in active_bullets:
+                        # Bullet disappeared - add impact effect
+                        if 0 <= owner_id < 8:
+                            weapon_id = self.player_weapons[int(owner_id)].gun_id
+                            self.effects_manager.add_impact_effect(prev_x, prev_y, weapon_id)
+                
+                self.prev_bullets = active_bullets
             
             if self.render_enabled:
                 self.render(game_world, gun_spawns)
@@ -257,12 +321,19 @@ class PlayerClient:
             self.screen.blit(weapon_name_surf, (10, 70))
             self.weapon_renderer.draw_ammo_counter(self.screen, weapon, 10, 95, self.font)
         
-        # Draw bullets
+        # Draw bullets with trails (Mini Militia style)
         for i in range(8, 48):
             if game_world[i, 0] == 0:
                 continue
             
             bx, by = int(game_world[i, 1]), int(game_world[i, 2])
+            bullet_angle = game_world[i, 3]
+            
+            # Draw bullet trail (line behind bullet)
+            trail_length = 15  # Trail length in pixels
+            trail_start_x = bx - int(np.cos(bullet_angle) * trail_length)
+            trail_start_y = by - int(np.sin(bullet_angle) * trail_length)
+            pygame.draw.line(self.screen, (255, 255, 100), (trail_start_x, trail_start_y), (bx, by), 2)
             
             # Draw bullet sprite if available
             if self.bullet_sprite:
@@ -270,15 +341,19 @@ class PlayerClient:
                 bullet_size = 6
                 scaled_bullet = pygame.transform.scale(self.bullet_sprite, (bullet_size, bullet_size))
                 # Rotate bullet to match trajectory
-                angle_degrees = np.degrees(game_world[i, 3])
+                angle_degrees = np.degrees(bullet_angle)
                 rotated_bullet = pygame.transform.rotate(scaled_bullet, -angle_degrees)
                 # Center the sprite
                 rect = rotated_bullet.get_rect(center=(bx, by))
                 self.screen.blit(rotated_bullet, rect.topleft)
             else:
-                # Fallback: draw circle
+                # Fallback: draw circle with glow
+                pygame.draw.circle(self.screen, (255, 255, 150), (bx, by), 3)
                 pygame.draw.circle(self.screen, (255, 255, 255), (bx, by), 2)
 
+        # Draw visual effects (muzzle flashes and impacts)
+        self.effects_manager.draw(self.screen)
+        
         pygame.display.update()
 
 

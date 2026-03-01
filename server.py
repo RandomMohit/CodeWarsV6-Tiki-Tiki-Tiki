@@ -190,6 +190,24 @@ class Server:
         
         return self.GROUND_Y
     
+    def _get_barrel_distance(self, weapon_id):
+        """Get distance from player center to gun barrel tip for bullet spawning"""
+        barrel_distances = {
+            1: 35, 2: 35, 6: 36,  # Pistols
+            7: 34, 8: 33, 9: 34,  # SMGs
+            0: 38, 4: 39, 12: 38, 13: 39,  # Assault Rifles
+            3: 42, 5: 45,  # Snipers
+            10: 37, 11: 41, 14: 40,  # Special weapons
+        }
+        return barrel_distances.get(weapon_id, 37)
+    
+    def _get_bullet_spawn_offset(self, weapon_id):
+        """Get x,y offset adjustments for bullet spawn (in pixels)"""
+        offsets = {
+            8: (6, 4),  # UZI: 6px forward, 4px perpendicular down
+        }
+        return offsets.get(weapon_id, (0, 0))
+    
     def get_extended_game_state(self):
         """Package world_data, gun spawns, and player inventories for client"""
         # Gun spawn data: [[x, y, weapon_id, is_active], ...]
@@ -272,11 +290,6 @@ class Server:
                     self.world_data[i, 3] -= AIM_ROTATION_SPEED
                 if self.player_inputs[i, 4] == 1:  # DOWN arrow
                     self.world_data[i, 3] += AIM_ROTATION_SPEED
-                
-                # Sync current ammo and total ammo to world_data for client display
-                current_gun = self.player_inventories[i].get_current_gun()
-                self.world_data[i, 9] = current_gun.current_ammo
-                self.world_data[i, 10] = current_gun.total_ammo
 
             # Jetpack system (W key = keyboard_input[0])
             jetpack_active = self.player_inputs[:, 0].astype(bool)
@@ -434,9 +447,23 @@ class Server:
                         # Calculate bullet angle with spread
                         bullet_angle = weapon.get_bullet_angle_with_spread(self.world_data[idx, 3])
                         
+                        # Get proper barrel distance for this weapon
+                        barrel_dist = self._get_barrel_distance(weapon.gun_id)
+                        offset_x, offset_y = self._get_bullet_spawn_offset(weapon.gun_id)
+                        
+                        # Calculate spawn position at gun barrel with offset
+                        spawn_x = self.world_data[idx, 1] + barrel_dist * np.cos(bullet_angle)
+                        spawn_y = self.world_data[idx, 2] + barrel_dist * np.sin(bullet_angle)
+                        
+                        # Apply perpendicular offset if needed
+                        if offset_x != 0 or offset_y != 0:
+                            perp_angle = bullet_angle + np.pi / 2
+                            spawn_x += offset_x * np.cos(bullet_angle) + offset_y * np.cos(perp_angle)
+                            spawn_y += offset_x * np.sin(bullet_angle) + offset_y * np.sin(perp_angle)
+                        
                         self.world_data[id+bullet_index, 0] = 1
-                        self.world_data[id+bullet_index, 1] = self.world_data[idx, 1] + np.cos(bullet_angle) * 15
-                        self.world_data[id+bullet_index, 2] = self.world_data[idx, 2] + np.sin(bullet_angle) * 15
+                        self.world_data[id+bullet_index, 1] = spawn_x
+                        self.world_data[id+bullet_index, 2] = spawn_y
                         self.world_data[id+bullet_index, 3] = bullet_angle
                         # Set bullet speed from weapon
                         self.world_data[id+bullet_index, 4] = weapon.bullet_speed
@@ -451,6 +478,17 @@ class Server:
                 if bullets_spawned > 0:
                     # Set cooldown based on weapon's rate of fire
                     self.player_fire_cooldown[idx] = weapon.rate_of_fire
+                    # Immediately sync ammo to world_data after shooting
+                    self.world_data[idx, 9] = weapon.current_ammo
+                    self.world_data[idx, 10] = weapon.total_ammo
+                    
+                    # Update bullet_old_positions for newly spawned bullets to prevent false collision checks
+                    for i in range(weapon.rpf):
+                        bullet_slot = id + i
+                        if bullet_slot < 48 and self.world_data[bullet_slot, 0] == 1:
+                            # Set old position to current position (spawn position) so first frame doesn't check from (0,0)
+                            bullet_old_positions[bullet_slot-8, 0] = self.world_data[bullet_slot, 1]
+                            bullet_old_positions[bullet_slot-8, 1] = self.world_data[bullet_slot, 2]
 
             # detect collisions
             # BULLET -> TANK collisions: apply damage, credit score, respawn on death
@@ -503,6 +541,13 @@ class Server:
                 # remove bullet after processing all potential hits
                 if bullet_hit:
                     self.world_data[b, 0] = 0
+            
+            # Sync all player ammo to world_data at end of frame (after all shooting/reloading)
+            for i in range(8):
+                if self.world_data[i, 0] == 1:
+                    current_gun = self.player_inventories[i].get_current_gun()
+                    self.world_data[i, 9] = current_gun.current_ammo
+                    self.world_data[i, 10] = current_gun.total_ammo
             
             # Store current inputs for next frame's edge detection
             self.previous_inputs = self.player_inputs.copy()
