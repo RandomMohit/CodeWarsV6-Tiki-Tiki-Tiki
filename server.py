@@ -4,14 +4,13 @@ import time
 import numpy as np
 import pygame
 import os
-from copy import deepcopy
-from scripts.guns.guns import Gun, GUN_DATA
-
-guns=[Gun(**data) for data in GUN_DATA]
+from weapons import WEAPONS, get_weapon
+from gun_spawner import GunSpawner, PlayerInventory
+import config
 
 class Server:
     def __init__(self):
-        PORT = 5555
+        PORT = config.SERVER_PORT
         if not self._start_server(PORT):
             return
 
@@ -20,76 +19,100 @@ class Server:
         thread = threading.Thread(target=self.add_players, daemon=True)
         thread.start()
 
+        self.player_lock = threading.Lock()
+
         self.run_game()
 
     def _start_server(self, PORT):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        SERVER_IP = "0.0.0.0" 
+
+        HOST_NAME = socket.gethostname()
+        SERVER_IP = socket.gethostbyname(HOST_NAME)
+
         try:
             self.server_socket.bind((SERVER_IP, PORT))
         except socket.error as e:
             print(str(e))
             print("[SERVER] Server could not start")
             return False
-        self.server_socket.listen()
-        print(f"[SERVER] Server Started on port {PORT}")
-        return True
 
+        self.server_socket.listen()
+
+        print(f"[SERVER] Server Started with local ip {SERVER_IP}")
+        return True
 
     def setup_game(self):
         self.player_count = 0
-
-        # ---- PLAYER STATE ----
-        self.player_gun_id = np.zeros(8, dtype=np.int32)
-        self.player_guns = [None] * 8   # filled when players join
-
-        # ---- WORLD DATA ----
-        # columns:
-        # 0:is_alive, 1:x, 2:y, 3:theta, 4:v, 5:omega_or_traveled,
-        # 6:fuel, 7:health_or_damage, 8:score, 9:owner_id, 10:gun_id
+        # world_data columns (per row):
+        # 0:is_alive, 1:x, 2:y, 3:theta, 4:v, 5:omega_or_traveled, 6:fuel, 7:health_or_damage, 8:score, 9:current_ammo, 10:total_ammo
+        # for tanks: column 6 = fuel, 7 = health, 8 = score, 9 = current_ammo, 10 = total_ammo
+        # for bullets: column 5 = distance traveled, 7 = damage, 9 = owner id
         self.world_data = np.zeros((48, 11), dtype=np.float64)
-   
-        self.player_inputs = np.zeros((8, 8), dtype=np.int32)
+        self.player_inputs = np.zeros((8, 10), dtype=np.int32)  # 10 inputs: W,A,D,UP,DOWN,LEFT,RIGHT,SPACE,R,S
 
-          # ---- MOVEMENT CONSTANTS ----
-        TANK_V = 3.0
-        TANK_OMEGA = 0.04
-        BULLET_V = 10.0
+        # Load constants from config
+        TANK_V = config.TANK_SPEED
+        TANK_OMEGA = config.TANK_ROTATION_SPEED
+        BULLET_V = config.BULLET_SPEED
 
         self.world_data[:8, 4] = TANK_V
         self.world_data[:8, 5] = TANK_OMEGA
         self.world_data[8:, 4] = BULLET_V
-
-        # ---- PHYSICS ----
+        # per-player vertical velocity for gravity (tanks only)
         self.player_vy = np.zeros(8, dtype=np.float64)
- 
-        self.TANK_RADIUS = 7.5
-        self.COLLISION_RADIUS = 6
-        self.GRAVITY = 0.8
-
-      
-        # ---- JETPACK ----
-        self.JETPACK_THRUST = 1.2   
-        self.FUEL_CONSUMPTION = 0.5
-        self.FUEL_RECHARGE = 0.2
-        self.MAX_FUEL = 100.0
-        self.player_fuel = np.full(8, self.MAX_FUEL, dtype=np.float64)
+        # screen and tank constants for ground handling
+        self.SCREEN_W = 800
+        self.SCREEN_H = 600
+        self.TANK_RADIUS = config.TANK_VISUAL_RADIUS
+        self.COLLISION_RADIUS = config.TANK_COLLISION_RADIUS
+        self.GROUND_Y = self.SCREEN_H - self.COLLISION_RADIUS
+        self.GRAVITY = config.GRAVITY
         
+        # Jetpack system
+        self.player_fuel = np.full(8, config.MAX_FUEL, dtype=np.float64)
+        self.MAX_FUEL = config.MAX_FUEL
+        self.FUEL_CONSUMPTION = config.FUEL_CONSUMPTION
+        self.FUEL_RECHARGE = config.FUEL_RECHARGE
+        self.JETPACK_THRUST = config.JETPACK_THRUST
+        
+        # Use column 6 (info) to store fuel for tanks
+        self.world_data[:8, 6] = self.player_fuel
 
-    
-        self.MAX_HEALTH = 200.0
-        self.world_data[:8, 7] = self.MAX_HEALTH
-        self.world_data[:8, 8] = 0.0
+        # Health and score per tank
+        self.MAX_HEALTH = config.MAX_HEALTH
+        self.world_data[:8, 7] = self.MAX_HEALTH  # health
+        self.world_data[:8, 8] = 0.0  # score
 
-        self.GRID_SIZE = 10
-        self.load_map("catacombs")
-
+        # Weapon system - player inventories with dual gun support
+        self.player_inventories = [PlayerInventory(starting_weapon_id=1) for _ in range(8)]
+        
+        # Fire rate cooldown per player (in seconds, tracks time since last shot)
+        self.player_fire_cooldown = np.zeros(8, dtype=np.float64)
+        # Reload cooldown per player (in seconds, tracks time remaining for reload)
+        self.player_reload_cooldown = np.zeros(8, dtype=np.float64)
+        # Track previous frame's input state for edge detection
+        self.previous_inputs = np.zeros((8, 10), dtype=np.int32)
+        self.last_frame_time = time.time()
+        
+        # Collision map system - grid-based obstacles
+        self.GRID_SIZE = config.GRID_SIZE
+        
+        # Load map from file - this will set GRID_W, GRID_H, and collision_map
+        self.current_map_name = config.DEFAULT_MAP
+        self.load_map(self.current_map_name)
+        
+        # Initialize gun spawner system
+        self.gun_spawner = GunSpawner()
+        self.gun_spawner.initialize_map(self.current_map_name)
+        
+        # Update screen dimensions based on loaded map
         self.SCREEN_W = self.GRID_W * self.GRID_SIZE
         self.SCREEN_H = self.GRID_H * self.GRID_SIZE
+        
+        # Convert map to bytes for transmission
         self.collision_map_bytes = self.collision_map.tobytes()
 
-    
     def load_map(self, map_name):
         """Load map from maps/ folder or create default if not found"""
         map_path = os.path.join("maps", f"{map_name}.npy")
@@ -166,13 +189,33 @@ class Server:
                 return gy * self.GRID_SIZE - self.COLLISION_RADIUS
         
         return self.GROUND_Y
+    
+    def get_extended_game_state(self):
+        """Package world_data, gun spawns, and player inventories for client"""
+        # Gun spawn data: [[x, y, weapon_id, is_active], ...]
+        spawn_data = self.gun_spawner.get_spawn_data_for_client()
+        
+        # Player inventory data: [[gun1_id, gun2_id, current_slot], ...] for 8 players
+        inventory_data = np.zeros((8, 3), dtype=np.int32)
+        for i in range(8):
+            gun_ids = self.player_inventories[i].get_gun_ids()
+            inventory_data[i, 0] = gun_ids[0]
+            inventory_data[i, 1] = gun_ids[1]
+            inventory_data[i, 2] = self.player_inventories[i].current_slot
+            
+            # Update ammo in world_data for current gun
+            current_gun = self.player_inventories[i].get_current_gun()
+            self.world_data[i, 9] = current_gun.current_ammo
+            self.world_data[i, 10] = current_gun.total_ammo
+        
+        return self.world_data, spawn_data, inventory_data
 
     def run_game(self):
-        MAX_BULLET_DIST = 1200
+        MAX_BULLET_DIST = config.MAX_BULLET_DISTANCE
 
         clock = pygame.time.Clock()
         while True:
-            clock.tick(60)
+            clock.tick(config.SERVER_FPS)
             # Tank movement: left/right using A/D keys (index 1=A, 2=D)
             horizontal_move = (self.player_inputs[:, 2] - self.player_inputs[:, 1]) * self.world_data[:8, 4]
             
@@ -196,11 +239,25 @@ class Server:
             
             # Aim control using all 4 arrow keys for continuous rotation
             # UP=3, DOWN=4, LEFT=5, RIGHT=6
-            AIM_ROTATION_SPEED = 0.08  # radians per frame
-            for pid in range(8):
-                if self.world_data[pid, 0] == 1:
-                    self.world_data[pid, 10] = self.player_gun_id[pid]
-
+            AIM_ROTATION_SPEED = config.AIM_ROTATION_SPEED
+            
+            # Handle gun switching (S key = input[9]) - only on key press (rising edge)
+            for i in range(8):
+                if self.world_data[i, 0] == 0:
+                    continue
+                # Only switch if S key is pressed now but wasn't pressed last frame
+                if self.player_inputs[i, 9] == 1 and self.previous_inputs[i, 9] == 0:
+                    self.player_inventories[i].switch_gun()
+            
+            # Handle reload (R key = input[8])
+            for i in range(8):
+                if self.world_data[i, 0] == 0:
+                    continue
+                if self.player_inputs[i, 8] == 1:  # R key pressed
+                    weapon = self.player_inventories[i].get_current_gun()
+                    # Only start reload if not already reloading and if reload is needed
+                    if self.player_reload_cooldown[i] <= 0 and weapon.current_ammo < weapon.magazine_capacity and weapon.total_ammo > 0:
+                        self.player_reload_cooldown[i] = weapon.reload_time
             
             for i in range(8):
                 if self.world_data[i, 0] == 0:
@@ -215,26 +272,26 @@ class Server:
                     self.world_data[i, 3] -= AIM_ROTATION_SPEED
                 if self.player_inputs[i, 4] == 1:  # DOWN arrow
                     self.world_data[i, 3] += AIM_ROTATION_SPEED
-
-            #JETPACK LOGIC
-            for i in range(8):
-                if self.world_data[i, 0] == 0:
-                    continue
                 
-                if self.player_inputs[i, 0] == 1 and self.player_fuel[i] > 0:
+                # Sync current ammo and total ammo to world_data for client display
+                current_gun = self.player_inventories[i].get_current_gun()
+                self.world_data[i, 9] = current_gun.current_ammo
+                self.world_data[i, 10] = current_gun.total_ammo
+
+            # Jetpack system (W key = keyboard_input[0])
+            jetpack_active = self.player_inputs[:, 0].astype(bool)
+            for i in range(8):
+                if self.world_data[i, 0] == 0:  # skip inactive players
+                    continue
+                if jetpack_active[i] and self.player_fuel[i] > 0:
                     # Apply upward thrust
                     self.player_vy[i] -= self.JETPACK_THRUST
                     # Consume fuel
-                    self.player_fuel[i] -= self.FUEL_CONSUMPTION
-                    if self.player_fuel[i] < 0:
-                        self.player_fuel[i] = 0
+                    self.player_fuel[i] = max(0, self.player_fuel[i] - self.FUEL_CONSUMPTION)
                 else:
                     # Recharge fuel when not using jetpack
-                    self.player_fuel[i] += self.FUEL_RECHARGE
-                    if self.player_fuel[i] > self.MAX_FUEL:
-                        self.player_fuel[i] = self.MAX_FUEL
-                
-                # Update fuel in world data for client sync
+                    self.player_fuel[i] = min(self.MAX_FUEL, self.player_fuel[i] + self.FUEL_RECHARGE)
+                # Update fuel in world_data
                 self.world_data[i, 6] = self.player_fuel[i]
 
             # Apply gravity and vertical movement with obstacle collision
@@ -271,6 +328,13 @@ class Server:
             # clamp vertical position to prevent going too far up
             self.world_data[:8, 2] = np.clip(self.world_data[:8, 2], self.TANK_RADIUS, self.SCREEN_H)
 
+            # Store bullet old positions before movement for interpolated collision detection
+            bullet_old_positions = np.zeros((40, 2), dtype=np.float64)  # 40 bullets, (x, y)
+            for b in range(8, 48):
+                if self.world_data[b, 0] == 1:
+                    bullet_old_positions[b-8, 0] = self.world_data[b, 1]
+                    bullet_old_positions[b-8, 1] = self.world_data[b, 2]
+
             # Move bullets and check collisions
             for b in range(8, 48):
                 if self.world_data[b, 0] == 1:  # if bullet is active
@@ -284,88 +348,164 @@ class Server:
                     # Update distance traveled
                     self.world_data[b, 5] += self.world_data[b, 4]
                     
-                    # Check if bullet hit obstacle (only if it has moved from spawn)
-                    if self.world_data[b, 5] > self.world_data[b, 4]:  # traveled more than one step
-                        new_x, new_y = self.world_data[b, 1], self.world_data[b, 2]
-                        
-                        # Check multiple points along the path
-                        steps = 5
-                        hit = False
-                        for i in range(steps + 1):
-                            t = i / steps
-                            check_x = old_x + (new_x - old_x) * t
-                            check_y = old_y + (new_y - old_y) * t
-                            if self.is_colliding_with_obstacle(check_x, check_y, 2):
-                                hit = True
-                                break
-                        
-                        if hit:
-                            self.world_data[b, 0] = 0  # deactivate bullet
+                    # Check if bullet hit obstacle along its path
+                    # Always check, even on first movement, to prevent bullets spawning through walls
+                    new_x, new_y = self.world_data[b, 1], self.world_data[b, 2]
+                    
+                    # Check multiple points along the path - more steps for faster bullets
+                    # Calculate dynamic step count based on bullet speed to ensure no gaps
+                    bullet_speed = self.world_data[b, 4]
+                    min_steps = max(10, int(bullet_speed / 2))  # At least 10 steps, more for faster bullets
+                    
+                    hit_obstacle = False
+                    for i in range(min_steps + 1):
+                        t = i / min_steps
+                        check_x = old_x + (new_x - old_x) * t
+                        check_y = old_y + (new_y - old_y) * t
+                        if self.is_colliding_with_obstacle(check_x, check_y, 3):  # Slightly larger radius for better detection
+                            hit_obstacle = True
+                            break
+                    
+                    if hit_obstacle:
+                        self.world_data[b, 0] = 0  # deactivate bullet
 
             # Deactivate bullets that traveled too far
             self.world_data[8:, 0] = np.where(self.world_data[8:, 5] > MAX_BULLET_DIST, 0, self.world_data[8:, 0])
 
-    
-            dt = 1 / 60.0
+            # Update fire cooldowns with delta time
+            current_time = time.time()
+            delta_time = current_time - self.last_frame_time
+            self.last_frame_time = current_time
+            self.player_fire_cooldown = np.maximum(0, self.player_fire_cooldown - delta_time)
+            
+            # Update gun spawner
+            self.gun_spawner.update(delta_time)
+            
+            # Check for gun pickups
+            for i in range(8):
+                if self.world_data[i, 0] == 1:  # Player is alive
+                    player_x = self.world_data[i, 1]
+                    player_y = self.world_data[i, 2]
+                    picked_weapon_id = self.gun_spawner.check_pickup(player_x, player_y)
+                    if picked_weapon_id is not None:
+                        self.player_inventories[i].pickup_gun(picked_weapon_id)
+            
+            # Update reload cooldowns and complete reloads when finished
+            for i in range(8):
+                if self.player_reload_cooldown[i] > 0:
+                    self.player_reload_cooldown[i] -= delta_time
+                    if self.player_reload_cooldown[i] <= 0:
+                        # Reload is complete
+                        self.player_reload_cooldown[i] = 0
+                        weapon = self.player_inventories[i].get_current_gun()
+                        weapon.reload()
 
-            for pid in range(8):
-                if self.world_data[pid, 0] == 0:
+            # create bullets (space = index 7)
+            shooting_id = np.where(self.player_inputs[:, 7] == 1)[0]
+            for idx in shooting_id:
+                weapon = self.player_inventories[idx].get_current_gun()
+                
+                # Check if currently reloading
+                if self.player_reload_cooldown[idx] > 0:
                     continue
-                gun = self.player_guns[pid]
-                if gun is None:
+                
+                # Check fire cooldown and ammo
+                if self.player_fire_cooldown[idx] > 0:
                     continue
-
-                # update gun cooldown
-                gun.update(dt)
-
-                # client intent: SPACE
-                if self.player_inputs[pid, 7] != 1:
+                
+                if not weapon.can_shoot():
+                    # Auto reload if out of ammo
+                    if weapon.total_ammo > 0:
+                        self.player_reload_cooldown[idx] = weapon.reload_time
                     continue
-
-                bullets = gun.shoot(
-                     self.world_data[pid, 1],  # x
-                     self.world_data[pid, 2],  # y
-                     self.world_data[pid, 3]   # angle
-                     )
-
-                for bullet in bullets:
-                    self._spawn_bullet(pid, bullet)
-
+                
+                # Shoot weapon
+                weapon.shoot()
+                    
+                id = idx * 5 + 8
+                
+                # Spawn bullets based on rpf (rounds per fire)
+                bullets_spawned = 0
+                for i in range(weapon.rpf):
+                    free_slots = np.where(self.world_data[id:id+5, 0] == 0)[0]
+                    if len(free_slots) > 0:
+                        bullet_index = free_slots[0]
+                        
+                        # Calculate bullet angle with spread
+                        bullet_angle = weapon.get_bullet_angle_with_spread(self.world_data[idx, 3])
+                        
+                        self.world_data[id+bullet_index, 0] = 1
+                        self.world_data[id+bullet_index, 1] = self.world_data[idx, 1] + np.cos(bullet_angle) * 15
+                        self.world_data[id+bullet_index, 2] = self.world_data[idx, 2] + np.sin(bullet_angle) * 15
+                        self.world_data[id+bullet_index, 3] = bullet_angle
+                        # Set bullet speed from weapon
+                        self.world_data[id+bullet_index, 4] = weapon.bullet_speed
+                        # reset traveled distance
+                        self.world_data[id+bullet_index, 5] = 0
+                        # set bullet damage from weapon
+                        self.world_data[id+bullet_index, 7] = weapon.damage
+                        # set bullet owner for scoring
+                        self.world_data[id+bullet_index, 9] = idx
+                        bullets_spawned += 1
+                
+                if bullets_spawned > 0:
+                    # Set cooldown based on weapon's rate of fire
+                    self.player_fire_cooldown[idx] = weapon.rate_of_fire
 
             # detect collisions
             # BULLET -> TANK collisions: apply damage, credit score, respawn on death
+            # Use interpolated path checking to prevent bullets from skipping over players
             for b in range(8, 48):
                 if self.world_data[b, 0] == 0:
                     continue
-                # bullet position
-                bx, by = self.world_data[b, 1]+20, self.world_data[b, 2]+10
+                
+                # Get bullet old and new positions
+                old_bx, old_by = bullet_old_positions[b-8, 0], bullet_old_positions[b-8, 1]
+                new_bx, new_by = self.world_data[b, 1], self.world_data[b, 2]
                 damage = self.world_data[b, 7]
                 owner = int(self.world_data[b, 9])
                 
                 bullet_hit = False
-                for t in range(8):
-                    if self.world_data[t, 0] == 0:
-                        continue
-                    if t == owner:
-                        continue
-                    tx, ty = self.world_data[t, 1], self.world_data[t, 2]
-                    dist = np.sqrt((tx - bx)**2 + (ty - by)**2)
-                    if dist < 25:
-                        # hit - apply damage
-                        self.world_data[t, 7] -= damage
-                        bullet_hit = True
-                        
-                        # check death
-                        if self.world_data[t, 7] <= 0:
-                            # credit score to owner if owner is valid
-                            if 0 <= owner < 8:
-                                self.world_data[owner, 8] += 1
-                            self.respawn(t)
+                # Check collision along the bullet's path with multiple interpolation steps
+                steps = 10  # More steps for better detection of fast bullets
+                for step in range(steps + 1):
+                    if bullet_hit:
                         break
+                    
+                    # Interpolate position along bullet path
+                    t = step / steps
+                    bx = old_bx + (new_bx - old_bx) * t
+                    by = old_by + (new_by - old_by) * t
+                    
+                    # Check against all players
+                    for tank in range(8):
+                        if self.world_data[tank, 0] == 0:
+                            continue
+                        if tank == owner:
+                            continue
+                        
+                        tx, ty = self.world_data[tank, 1], self.world_data[tank, 2]
+                        dist = np.sqrt((tx - bx)**2 + (ty - by)**2)
+                        
+                        if dist < config.BULLET_HIT_RADIUS:
+                            # hit - apply damage
+                            self.world_data[tank, 7] -= damage
+                            bullet_hit = True
+                            
+                            # check death
+                            if self.world_data[tank, 7] <= 0:
+                                # credit score to owner if owner is valid
+                                if 0 <= owner < 8:
+                                    self.world_data[owner, 8] += 1
+                                self.respawn(tank)
+                            break
                 
                 # remove bullet after processing all potential hits
                 if bullet_hit:
                     self.world_data[b, 0] = 0
+            
+            # Store current inputs for next frame's edge detection
+            self.previous_inputs = self.player_inputs.copy()
 
     def respawn(self, tank_index):
         # spawn at a random x and find ground below
@@ -384,29 +524,25 @@ class Server:
         # reset health on respawn
         if hasattr(self, 'MAX_HEALTH'):
             self.world_data[tank_index, 7] = self.MAX_HEALTH
-    def _spawn_bullet(self, owner_id, bullet):
-        """Find an inactive bullet slot and spawn the bullet there"""
-        for b in range(8, 48):
-            if self.world_data[b, 0] == 0:
-                self.world_data[b, 0] = 1
-                self.world_data[b, 1] = bullet["x"]
-                self.world_data[b, 2] = bullet["y"]
-                self.world_data[b, 3] = np.arctan2(bullet["vy"], bullet["vx"])
-                self.world_data[b, 4] = np.hypot(bullet["vx"], bullet["vy"])
-                self.world_data[b, 5] = 0
-                self.world_data[b, 7] = bullet["damage"]
-                self.world_data[b, 9] = owner_id
-                break
+
     def add_players(self):
         while True:
             conn, address = self.server_socket.accept()
 
-            available_ids = np.where(self.world_data[:8, 0] == 0)[0]
-            if len(available_ids) == 0:
-                print("server full")
-                continue
+            with self.player_lock:
+                available_ids = np.where(self.world_data[:8, 0] == 0)[0]
+                if len(available_ids) == 0:
+                    print("server full")
+                    continue
 
-            thread = threading.Thread(target=self.player_handler, args=(conn, available_ids[0]), daemon=True)
+                player_id = available_ids[0]
+                self.world_data[player_id, 0] = -1  # temporarily reserve slot
+
+            thread = threading.Thread(
+                target=self.player_handler,
+                args=(conn, player_id),
+                daemon=True
+            )
             thread.start()
             self.player_count += 1
             
@@ -416,19 +552,7 @@ class Server:
         name = data.decode("utf-8")
         print("[LOG]", name, "connected to the server.")
 
-        conn.sendall(np.int32(player_id).tobytes())
-
-        # assign default gun (e.g. pistol = index 0)
-        default_gun_id = 1
-
-        self.player_gun_id[player_id] = default_gun_id
-        self.player_guns[player_id] = deepcopy(guns[default_gun_id])
-
-        # sync gun id to world_data
-        self.world_data[player_id, 10] = default_gun_id
-
-        self.world_data[player_id, 0] = 1  # alive
-        self.respawn(player_id)
+        conn.send(int(player_id).to_bytes(4, byteorder='little'))
         
         # Send collision map dimensions and data
         map_info = np.array([self.GRID_W, self.GRID_H, self.GRID_SIZE], dtype=np.int32)
@@ -439,7 +563,7 @@ class Server:
         self.respawn(player_id)
 
         while True:
-            data = conn.recv(8)  # now receiving 8 inputs
+            data = conn.recv(10)  # now receiving 10 inputs (added reload and switch)
             if not data:
                 self.world_data[player_id, 0] = 0
                 if hasattr(self, 'player_vy'):
@@ -448,7 +572,12 @@ class Server:
 
             player_input = np.frombuffer(data, dtype=bool)
             self.player_inputs[player_id] = player_input.astype(int)
-            conn.send(self.world_data.tobytes())
+            
+            # Prepare extended game state
+            world_data, spawn_data, inventory_data = self.get_extended_game_state()
+            
+            # Send all data: world_data + spawn_data + inventory_data
+            conn.send(world_data.tobytes() + spawn_data.tobytes() + inventory_data.tobytes())
 
 
             

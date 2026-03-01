@@ -1,15 +1,16 @@
 import pygame
 import numpy as np
 import os
+from config import WEAPON_STATS
 
 class MapEditor:
     def __init__(self):
         pygame.init()
         
         # Grid settings (must match server settings)
-        self.CELL_SIZE = 20
-        self.GRID_W = 40  # 800 / 20
-        self.GRID_H = 30  # 600 / 20
+        self.CELL_SIZE = 10
+        self.GRID_W = 80  # 800 / 10
+        self.GRID_H = 60  # 600 / 10
         self.SCREEN_W = self.GRID_W * self.CELL_SIZE
         self.SCREEN_H = self.GRID_H * self.CELL_SIZE
         
@@ -19,7 +20,10 @@ class MapEditor:
         # Create default ground
         self.collision_map[-1, :] = 0  # bottom row is solid
         
-        self.screen = pygame.display.set_mode((self.SCREEN_W, self.SCREEN_H + 100))
+        # Weapon spawn points: [(x, y, weapon_id), ...]
+        self.weapon_spawns = []
+        
+        self.screen = pygame.display.set_mode((self.SCREEN_W, self.SCREEN_H + 100), pygame.RESIZABLE)
         pygame.display.set_caption("PyTanks Map Editor")
         
         self.font = pygame.font.SysFont(None, 24)
@@ -27,31 +31,57 @@ class MapEditor:
         
         self.drawing = False
         self.erasing = False
+        self.placing_weapon = False
+        self.selected_weapon_id = 0  # Currently selected weapon to place
         self.current_map_name = "default"
         
         self.run()
     
     def save_map(self, filename):
-        """Save map to maps/ folder"""
+        """Save map to maps/ folder (both collision map and weapon spawns)"""
+        import json
+        
         maps_dir = "maps"
         if not os.path.exists(maps_dir):
             os.makedirs(maps_dir)
         
-        filepath = os.path.join(maps_dir, f"{filename}.npy")
-        np.save(filepath, self.collision_map)
-        print(f"Map saved: {filepath}")
-        return filepath
+        # Save collision map
+        collision_filepath = os.path.join(maps_dir, f"{filename}.npy")
+        np.save(collision_filepath, self.collision_map)
+        
+        # Save weapon spawns
+        spawns_filepath = os.path.join(maps_dir, f"{filename}_spawns.json")
+        with open(spawns_filepath, 'w') as f:
+            json.dump(self.weapon_spawns, f, indent=2)
+        
+        print(f"Map saved: {collision_filepath}")
+        print(f"Weapon spawns saved: {spawns_filepath} ({len(self.weapon_spawns)} spawns)")
+        return collision_filepath
     
     def load_map(self, filename):
-        """Load map from maps/ folder"""
-        filepath = os.path.join("maps", f"{filename}.npy")
-        if os.path.exists(filepath):
-            self.collision_map = np.load(filepath)
+        """Load map from maps/ folder (both collision map and weapon spawns)"""
+        import json
+        
+        collision_filepath = os.path.join("maps", f"{filename}.npy")
+        spawns_filepath = os.path.join("maps", f"{filename}_spawns.json")
+        
+        if os.path.exists(collision_filepath):
+            self.collision_map = np.load(collision_filepath)
             self.current_map_name = filename
-            print(f"Map loaded: {filepath}")
+            print(f"Map loaded: {collision_filepath}")
+            
+            # Load weapon spawns if they exist
+            if os.path.exists(spawns_filepath):
+                with open(spawns_filepath, 'r') as f:
+                    self.weapon_spawns = json.load(f)
+                print(f"Weapon spawns loaded: {len(self.weapon_spawns)} spawns")
+            else:
+                self.weapon_spawns = []
+                print(f"No weapon spawns file found for {filename}")
+            
             return True
         else:
-            print(f"Map not found: {filepath}")
+            print(f"Map not found: {collision_filepath}")
             return False
     
     def get_available_maps(self):
@@ -67,9 +97,10 @@ class MapEditor:
         return sorted(map_files)
     
     def clear_map(self):
-        """Clear entire map"""
+        """Clear entire map and weapon spawns"""
         self.collision_map = np.ones((self.GRID_H, self.GRID_W), dtype=np.int32)
-        print("Map cleared")
+        self.weapon_spawns = []
+        print("Map and weapon spawns cleared")
     
     def fill_bottom(self):
         """Fill bottom row with obstacles (ground)"""
@@ -96,13 +127,23 @@ class MapEditor:
                     running = False
                 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
-                    my = event.pos[1]
+                    mx, my = event.pos[0], event.pos[1]
                     # Check if click is in grid area
                     if my < self.SCREEN_H:
-                        if event.button == 1:  # Left click - draw obstacles
-                            self.drawing = True
-                        elif event.button == 3:  # Right click - erase obstacles
-                            self.erasing = True
+                        if self.placing_weapon and event.button == 1:
+                            # Place weapon spawn at click position
+                            self.weapon_spawns.append([mx, my, self.selected_weapon_id])
+                            print(f"Placed {WEAPON_STATS[self.selected_weapon_id]['name']} spawn at ({mx}, {my})")
+                        elif self.placing_weapon and event.button == 3:
+                            # Remove weapon spawn near click
+                            remove_radius = 15
+                            self.weapon_spawns = [s for s in self.weapon_spawns 
+                                                 if not (abs(s[0] - mx) < remove_radius and abs(s[1] - my) < remove_radius)]
+                        elif not self.placing_weapon:
+                            if event.button == 1:  # Left click - draw obstacles
+                                self.drawing = True
+                            elif event.button == 3:  # Right click - erase obstacles
+                                self.erasing = True
                 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     self.drawing = False
@@ -150,10 +191,29 @@ class MapEditor:
                             input_active = True
                             input_mode = 'load'
                             input_text = ""
+                        elif event.key == pygame.K_b:  # Browse maps
+                            show_map_browser = True
+                            available_maps = self.get_available_maps()
+                            selected_map_index = 0
+                            print(f"Opening map browser, found {len(available_maps)} maps")
                         elif event.key == pygame.K_c:  # Clear map
                             self.clear_map()
                         elif event.key == pygame.K_g:  # Add ground
                             self.fill_bottom()
+                        elif event.key == pygame.K_w:  # Toggle weapon spawn mode
+                            self.placing_weapon = not self.placing_weapon
+                            mode_text = "ON" if self.placing_weapon else "OFF"
+                            print(f"Weapon spawn mode: {mode_text}")
+                        elif event.key == pygame.K_LEFT:  # Previous weapon
+                            weapon_ids = sorted(WEAPON_STATS.keys())
+                            current_idx = weapon_ids.index(self.selected_weapon_id)
+                            self.selected_weapon_id = weapon_ids[(current_idx - 1) % len(weapon_ids)]
+                            print(f"Selected weapon: {WEAPON_STATS[self.selected_weapon_id]['name']}")
+                        elif event.key == pygame.K_RIGHT:  # Next weapon
+                            weapon_ids = sorted(WEAPON_STATS.keys())
+                            current_idx = weapon_ids.index(self.selected_weapon_id)
+                            self.selected_weapon_id = weapon_ids[(current_idx + 1) % len(weapon_ids)]
+                            print(f"Selected weapon: {WEAPON_STATS[self.selected_weapon_id]['name']}")
                         elif event.key == pygame.K_q:  # Quit
                             running = False
             
@@ -190,15 +250,27 @@ class MapEditor:
                 pygame.draw.rect(self.screen, color, (x, y, self.CELL_SIZE, self.CELL_SIZE))
                 pygame.draw.rect(self.screen, (60, 60, 60), (x, y, self.CELL_SIZE, self.CELL_SIZE), 1)
         
+        # Draw weapon spawn markers
+        for spawn in self.weapon_spawns:
+            x, y, weapon_id = spawn
+            # Draw glow circle
+            pygame.draw.circle(self.screen, (255, 215, 0), (int(x), int(y)), 12, 2)
+            pygame.draw.circle(self.screen, (255, 215, 0, 128), (int(x), int(y)), 8)
+            # Draw weapon name
+            weapon_name = WEAPON_STATS[weapon_id]['name'][:6]  # Truncate long names
+            name_surf = self.small_font.render(weapon_name, True, (255, 255, 255))
+            self.screen.blit(name_surf, (int(x) - name_surf.get_width()//2, int(y) + 15))
+        
         # Draw UI panel at bottom
         panel_y = self.SCREEN_H
         pygame.draw.rect(self.screen, (50, 50, 50), (0, panel_y, self.SCREEN_W, 100))
         
         # Instructions
+        mode_indicator = f"[WEAPON MODE: {WEAPON_STATS[self.selected_weapon_id]['name']}]" if self.placing_weapon else "[OBSTACLE MODE]"
         instructions = [
-            "LEFT CLICK: Draw obstacles | RIGHT CLICK: Erase | S: Save | L: Load | B: Browse maps",
-            "C: Clear map | G: Add ground | Q: Quit",
-            f"Current map: {self.current_map_name}"
+            "W: Toggle weapon mode | LEFT/RIGHT: Select weapon | LEFT CLICK: Place/Draw | RIGHT CLICK: Remove/Erase",
+            "S: Save | L: Load | B: Browse | C: Clear | G: Add ground | Q: Quit",
+            f"Map: {self.current_map_name} | Mode: {mode_indicator} | Weapon spawns: {len(self.weapon_spawns)}"
         ]
         
         for i, text in enumerate(instructions):

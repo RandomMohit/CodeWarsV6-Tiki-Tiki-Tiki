@@ -1,198 +1,313 @@
-import os
-import math
 import pygame
+import threading
+import importlib
 import numpy as np
-import time
-
 from client import Network
-from scripts.guns.guns import Gun, GUN_DATA
-
+import time
+from weapons import WEAPONS
+from weapon_renderer import WeaponRenderer
+import config
+from scripts.bot import Bot
 
 class PlayerClient:
-    def __init__(self, W=800, H=600):
-        pygame.init()
+    def __init__(self, script_name=None, render=True, W=800, H=600):
 
-        # TEMP display (will resize after map info)
-        self.screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
-        pygame.display.set_caption("PyTanks")
+        self.render_enabled = render
 
-        self.font = pygame.font.SysFont(None, 24)
+        # ---- Only initialize pygame window in main thread ----
+        if self.render_enabled:
+            self.screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
+            pygame.display.set_caption("PyTanks")
+            self.font = pygame.font.SysFont(None, 24)
 
-        # ---- LOAD GUN DATA (NO SPRITES YET) ----
-        self.guns = [Gun(**data) for data in GUN_DATA]
-
-        self.get_player_name()
+        self.name = script_name if script_name is not None else "Keyboard"
         self.join_server()
 
-        # ---- RESIZE DISPLAY BASED ON MAP ----
-        map_w = self.grid_w * self.grid_size
-        map_h = self.grid_h * self.grid_size
-        self.screen = pygame.display.set_mode((map_w, map_h), pygame.RESIZABLE)
+        # ---- Input provider ----
+        if script_name is not None:
+            self.input_provider = Bot(self.ID, script_name)
+        else:
+            self.input_provider = None
 
-        # ---- LOAD SPRITES AFTER DISPLAY ----
-        self.load_sprites()
+        # ---- Rendering-only resources ----
+        if self.render_enabled:
+            map_width = self.grid_w * self.grid_size
+            map_height = self.grid_h * self.grid_size
+            self.screen = pygame.display.set_mode((map_width, map_height), pygame.RESIZABLE)
 
-        self.running = True
+            self.weapon_renderer = WeaponRenderer()
+            self.bullet_sprite = self.weapon_renderer.load_gun_sprite("bullet.png")
+            self.player_weapons = [WEAPONS[1] for _ in range(8)]
+
         self.run_game()
-        self.quit_game()
 
-    # ------------------------------------
-    # INITIALIZATION
-    # ------------------------------------
+        if self.render_enabled:
+            self.quit_game()
+
     def get_player_name(self):
         self.name = ""
         while not (0 < len(self.name) < 20):
             self.name = input("Please enter your name: ")
 
     def join_server(self):
-        print("Connecting to server...")
         self.server = Network()
         self.ID = self.server.connect(self.name)
+        self.collision_map, self.grid_w, self.grid_h, self.grid_size = self.server.get_collision_map()
+        self.running = True
+        print("Connected to server, player ID:", self.ID)
 
-        (
-            self.collision_map,
-            self.grid_w,
-            self.grid_h,
-            self.grid_size
-        ) = self.server.get_collision_map()
-
-        print("Connected as player", self.ID)
-
-    def load_sprites(self):
-        # Placeholder player body
-        self.player_img = pygame.Surface((25, 25), pygame.SRCALPHA)
-        pygame.draw.circle(self.player_img, (100, 150, 255), (12, 12), 7)
-
-        self.gun_sprites = {}
-        for i, data in enumerate(GUN_DATA):
-            path = os.path.join(
-                "scripts", "guns", "gunsprites", data["sprite"]
-            )
-            self.gun_sprites[i] = pygame.image.load(path).convert_alpha()
-
-    # ------------------------------------
-    # DRAWING HELPERS
-    # ------------------------------------
-    def draw_player_with_gun(self, x, y, angle, gun_id, is_local):
-        # body
-        body_rect = self.player_img.get_rect(center=(x, y))
-        self.screen.blit(self.player_img, body_rect)
-
-        gun_img = self.gun_sprites.get(gun_id)
-        gun_img= pygame.transform.smoothscale(gun_img,(20,10))
-        if gun_img is None:
-            return
-
-        offset = 15
-        gx = x + math.cos(angle) * offset
-        gy = y + math.sin(angle) * offset
-
-        rotated = pygame.transform.rotate(
-            gun_img, -math.degrees(angle)
-        )
-        gun_rect = rotated.get_rect(center=(gx, gy))
-        self.screen.blit(rotated, gun_rect)
-
-        # local player indicator
-        if is_local:
-            pygame.draw.circle(self.screen, (0, 0, 255), (int(x), int(y)), 7, )
-
-    # ------------------------------------
-    # GAME LOOP
-    # ------------------------------------
     def run_game(self):
-        clock = pygame.time.Clock()
-        guns = [Gun(**data) for data in GUN_DATA]
+
+        if self.render_enabled:
+            clock = pygame.time.Clock()
+        else:
+            clock = None
+
+        keyboard_input = np.zeros(10, dtype=bool)
+
         while self.running:
-            clock.tick(60)
+            if self.render_enabled:
+                clock.tick(config.GAME_FPS)
+            else: 
+                time.sleep(1 / config.GAME_FPS)
 
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.running = False
+            if self.render_enabled:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.running = False
 
-            keyboard_input = np.zeros(8, dtype=bool)
-            keys = pygame.key.get_pressed()
+            result = self.server.send(keyboard_input)
 
-            keyboard_input[0] = keys[pygame.K_w]
-            keyboard_input[1] = keys[pygame.K_a]
-            keyboard_input[2] = keys[pygame.K_d]
-            keyboard_input[3] = keys[pygame.K_UP]
-            keyboard_input[4] = keys[pygame.K_DOWN]
-            keyboard_input[5] = keys[pygame.K_LEFT]
-            keyboard_input[6] = keys[pygame.K_RIGHT]
-            keyboard_input[7] = keys[pygame.K_SPACE]
-
-            if keys[pygame.K_ESCAPE]:
+            if result is None or result[0] is None:
                 self.running = False
+                break
 
-            game_world = self.server.send(keyboard_input)
-            self.render(game_world)
+            game_world, gun_spawns, inventory_data = result
 
-    # ------------------------------------
-    # RENDER
-    # ------------------------------------
-    def render(self, game_world):
-        guns = [Gun(**data) for data in GUN_DATA]
-        self.screen.fill((0, 0, 0))
+            if self.input_provider is not None:
+                self.input_provider.update_state(
+                    game_world,
+                    gun_spawns,
+                    inventory_data,
+                    self.collision_map,
+                    self.grid_size
+                )
+                keyboard_input = self.input_provider.get_action()
+            else:
+                keyboard_input = np.zeros(10, dtype=bool)
+                keys = pygame.key.get_pressed()
+                # keyboard mapping...
 
-        # 1️⃣ MAP
+                if keys[pygame.K_w]: keyboard_input[0] = 1
+                if keys[pygame.K_a]: keyboard_input[1] = 1
+                if keys[pygame.K_d]: keyboard_input[2] = 1
+                if keys[pygame.K_UP]: keyboard_input[3] = 1
+                if keys[pygame.K_DOWN]: keyboard_input[4] = 1
+                if keys[pygame.K_LEFT]: keyboard_input[5] = 1
+                if keys[pygame.K_RIGHT]: keyboard_input[6] = 1
+                if keys[pygame.K_SPACE]: keyboard_input[7] = 1
+                if keys[pygame.K_r]: keyboard_input[8] = 1
+                if keys[pygame.K_s]: keyboard_input[9] = 1
+          
+            # Update player weapons from inventory data
+            if self.render_enabled and inventory_data is not None:
+                for i in range(8):
+                    gun1_id, gun2_id, current_slot = inventory_data[i]
+                    # For now, just track current gun (client-side full inventory tracking can be added later)
+                    if gun1_id >= 0:
+                        if current_slot == 0:
+                            current_gun_id = gun1_id
+                        elif gun2_id >= 0:
+                            current_gun_id = gun2_id
+                        else:
+                            current_gun_id = gun1_id
+                        
+                        # Update player's displayed weapon
+                        from weapons import WEAPONS
+                        if current_gun_id in WEAPONS:
+                            self.player_weapons[i] = WEAPONS[current_gun_id]
+            
+            # Update player weapon ammo from server (synced via world_data columns 9 and 10)
+            if self.render_enabled:
+                for i in range(8):
+                    if game_world[i, 0] == 1:  # if player is active
+                        self.player_weapons[i].current_ammo = int(game_world[i, 9])
+                        self.player_weapons[i].total_ammo = int(game_world[i, 10])
+            
+            if self.render_enabled:
+                self.render(game_world, gun_spawns)
+
+    def render(self, game_world, gun_spawns):
+        # Brown background (open space)
+        self.screen.fill(config.BACKGROUND_COLOR)
+        
+        # Draw collision map obstacles (light brown/yellowish blocks)
         for gy in range(self.grid_h):
             for gx in range(self.grid_w):
-                if self.collision_map[gy, gx] == 0:
-                    pygame.draw.rect(
-                        self.screen,
-                        (70, 70, 70),
-                        (
-                            gx * self.grid_size,
-                            gy * self.grid_size,
-                            self.grid_size,
-                            self.grid_size,
-                        ),
-                    )
-
-        # 2️⃣ PLAYERS + GUNS
+                if self.collision_map[gy, gx] == 0:  # obstacle
+                    x = gx * self.grid_size
+                    y = gy * self.grid_size
+                    pygame.draw.rect(self.screen, config.OBSTACLE_COLOR, (x, y, self.grid_size, self.grid_size))
+                    # Add darker border for visibility
+                    pygame.draw.rect(self.screen, config.OBSTACLE_BORDER_COLOR, (x, y, self.grid_size, self.grid_size), 1)
+        
+        # Draw gun spawns with actual gun images
+        for spawn in gun_spawns:
+            x, y, weapon_id, is_active = spawn
+            if is_active == 1:
+                # Draw glow effect behind gun
+                pygame.draw.circle(self.screen, config.GUN_SPAWN_GLOW_COLOR, (int(x), int(y)), 18)
+                
+                # Get and draw the gun sprite
+                weapon_id_int = int(weapon_id)
+                from weapons import WEAPONS
+                if weapon_id_int in WEAPONS:
+                    weapon = WEAPONS[weapon_id_int]
+                    gun_sprite = self.weapon_renderer.load_gun_sprite(weapon.sprite_file)
+                    if gun_sprite:
+                        # Scale the gun sprite for pickup display (similar to player size)
+                        gun_width = gun_sprite.get_width()
+                        gun_height = gun_sprite.get_height()
+                        target_size = config.GUN_SPAWN_SCALE
+                        scale_factor = target_size / max(gun_width, gun_height)
+                        scaled_sprite = pygame.transform.scale(gun_sprite, 
+                            (int(gun_width * scale_factor), int(gun_height * scale_factor)))
+                        
+                        # Center the gun sprite at spawn location
+                        sprite_x = int(x) - scaled_sprite.get_width() // 2
+                        sprite_y = int(y) - scaled_sprite.get_height() // 2
+                        self.screen.blit(scaled_sprite, (sprite_x, sprite_y))
+                    else:
+                        # Fallback if sprite not found
+                        pygame.draw.circle(self.screen, (255, 255, 0), (int(x), int(y)), 8)
+                        text = self.font.render("G", True, (0, 0, 0))
+                        self.screen.blit(text, (int(x) - 6, int(y) - 8))
+        
         for i in range(8):
             if game_world[i, 0] == 0:
                 continue
 
-            gun_id = int(game_world[i, 10])
-            self.draw_player_with_gun(
-                game_world[i, 1],
-                game_world[i, 2],
-                game_world[i, 3],
-                gun_id,
-                is_local=(i == self.ID),
+            color = config.PLAYER_COLOR
+            if i == self.ID:
+                    color = config.SELF_COLOR
+            # Draw player circle
+            pygame.draw.circle(self.screen, color, (int(game_world[i, 1]), int(game_world[i, 2])), 12.5)
+            
+            # Draw weapon instead of aim line
+            self.weapon_renderer.draw_gun(
+                self.screen, 
+                int(game_world[i, 1]), 
+                int(game_world[i, 2]), 
+                game_world[i, 3],  # angle
+                self.player_weapons[i],
+                tank_radius=12.5
             )
+            
+            # Draw jetpack indicator (orange dot below player when fuel is being used)
+            # If fuel is decreasing (not at max), show jetpack is active
+            fuel = game_world[i, 6]
+            if fuel < 99.9:  # jetpack was used recently
+                pygame.draw.circle(self.screen, (255, 165, 0), (int(game_world[i, 1]), int(game_world[i, 2] + 17.5)), 5)
 
-        # 3️⃣ BULLETS
-        for i in range(8, 48):
-            if game_world[i, 0] == 1:
-                pygame.draw.circle(
-                    self.screen,
-                    (255, 255, 255),
-                    (int(game_world[i, 1]), int(game_world[i, 2])),
-                    2,
-                )
-
-        # 4️⃣ UI
+            # Draw small health bar above each player
+            health = game_world[i, 7]
+            if health is not None:
+                # clamp and compute percent
+                health_percent = max(0.0, min(1.0, health / 200.0))
+                hb_x = int(game_world[i, 1]) - 20
+                hb_y = int(game_world[i, 2]) - 40
+                hb_w, hb_h = 40, 6
+                pygame.draw.rect(self.screen, (50, 50, 50), (hb_x, hb_y, hb_w, hb_h))
+                pygame.draw.rect(self.screen, (255, 0, 0), (hb_x, hb_y, int(hb_w * health_percent), hb_h))
+                pygame.draw.rect(self.screen, (255, 255, 255), (hb_x, hb_y, hb_w, hb_h), 1)
+        
+        # Draw fuel meter for local player
         if game_world[self.ID, 0] == 1:
             fuel = game_world[self.ID, 6]
+            fuel_percent = fuel / 100.0
+            # Draw fuel bar in top-left corner
+            bar_x, bar_y = 10, 10
+            bar_width, bar_height = 200, 20
+            # Background (empty)
+            pygame.draw.rect(self.screen, (50, 50, 50), (bar_x, bar_y, bar_width, bar_height))
+            # Fuel level (cyan color like Mini Militia)
+            fuel_width = int(bar_width * fuel_percent)
+            pygame.draw.rect(self.screen, (0, 255, 255), (bar_x, bar_y, fuel_width, bar_height))
+            # Border
+            pygame.draw.rect(self.screen, (255, 255, 255), (bar_x, bar_y, bar_width, bar_height), 2)
+
+            # Draw health bar below fuel
             health = game_world[self.ID, 7]
+            health_percent = max(0.0, min(1.0, health / 200.0))
+            hbar_x, hbar_y = 10, 40
+            hbar_w, hbar_h = 200, 20
+            pygame.draw.rect(self.screen, (50, 50, 50), (hbar_x, hbar_y, hbar_w, hbar_h))
+            pygame.draw.rect(self.screen, (255, 0, 0), (hbar_x, hbar_y, int(hbar_w * health_percent), hbar_h))
+            pygame.draw.rect(self.screen, (255, 255, 255), (hbar_x, hbar_y, hbar_w, hbar_h), 2)
+
+            # Draw score at top-center (always visible)
             score = int(game_world[self.ID, 8])
-
-            pygame.draw.rect(self.screen, (0, 255, 255), (10, 10, fuel * 2, 15))
-            pygame.draw.rect(self.screen, (255, 0, 0), (10, 30, health, 15))
-
             score_surf = self.font.render(f"Score: {score}", True, (255, 255, 255))
-            self.screen.blit(score_surf, (self.screen.get_width() // 2 - 40, 10))
+            sx = self.screen.get_width() // 2 - score_surf.get_width() // 2
+            self.screen.blit(score_surf, (sx, 10))
+            
+            # Draw weapon name and ammo counter
+            weapon = self.player_weapons[self.ID]
+            weapon_name_surf = self.font.render(weapon.name, True, (255, 255, 255))
+            self.screen.blit(weapon_name_surf, (10, 70))
+            self.weapon_renderer.draw_ammo_counter(self.screen, weapon, 10, 95, self.font)
+        
+        # Draw bullets
+        for i in range(8, 48):
+            if game_world[i, 0] == 0:
+                continue
+            
+            bx, by = int(game_world[i, 1]), int(game_world[i, 2])
+            
+            # Draw bullet sprite if available
+            if self.bullet_sprite:
+                # Scale bullet sprite to small size
+                bullet_size = 6
+                scaled_bullet = pygame.transform.scale(self.bullet_sprite, (bullet_size, bullet_size))
+                # Rotate bullet to match trajectory
+                angle_degrees = np.degrees(game_world[i, 3])
+                rotated_bullet = pygame.transform.rotate(scaled_bullet, -angle_degrees)
+                # Center the sprite
+                rect = rotated_bullet.get_rect(center=(bx, by))
+                self.screen.blit(rotated_bullet, rect.topleft)
+            else:
+                # Fallback: draw circle
+                pygame.draw.circle(self.screen, (255, 255, 255), (bx, by), 2)
 
-        pygame.display.flip()
+        pygame.display.update()
 
-    # ------------------------------------
+
     def quit_game(self):
         self.server.disconnect()
         pygame.quit()
-
+        quit()
+	
+def launch_bot(script_name):
+    PlayerClient(script_name=script_name, render=False)
 
 if __name__ == "__main__":
-    PlayerClient()
+
+    pygame.init()
+
+    threads = []
+
+    # 1️⃣ Start headless bots in background threads
+    for script in config.BOT_SCRIPTS:
+        t = threading.Thread(
+            target=launch_bot,
+            args=(script,),
+            daemon=True
+        )
+        t.start()
+        threads.append(t)
+
+    # 2️⃣ Run keyboard player OR first bot in MAIN thread
+    if config.ENABLE_KEYBOARD_PLAYER:
+        PlayerClient(script_name=None, render=True)
+    else:
+        PlayerClient(script_name=config.BOT_SCRIPTS[0], render=True)
