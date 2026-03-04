@@ -143,3 +143,93 @@ class WeaponRenderer:
             rect = pygame.Rect(x - size/2, y - size/4, size, size/2)
             pygame.draw.rect(screen, (150, 150, 150), rect)
     
+    def draw_grenade(self, screen, x, y, grenade_type, sprite_file, is_armed):
+        """
+        Draw a grenade sprite at the given position
+        
+        Args:
+            screen: pygame surface
+            x, y: grenade position
+            grenade_type: grenade type ID (1=frag, 2=proxy, 3=gas)
+            sprite_file: grenade sprite filename
+            is_armed: whether proximity grenade is armed
+        """
+        grenade_directory = os.path.join("assets", "grenades")
+        
+        if sprite_file:
+            sprite_path = os.path.join(grenade_directory, sprite_file)
+            
+            if os.path.exists(sprite_path):
+                try:
+                    sprite = pygame.image.load(sprite_path).convert_alpha()
+                    # Scale grenade sprite to reasonable size (10x10 pixels)
+                    scaled_sprite = pygame.transform.scale(sprite, (10, 10))
+                    screen.blit(scaled_sprite, (x - 5, y - 5))
+                    
+                    # Draw indicator for armed proximity grenades
+                    if is_armed and grenade_type == 2:
+                        pygame.draw.circle(screen, (255, 0, 0), (int(x), int(y)), 12, 1)
+                    return
+                except Exception as e:
+                    pass
+        
+        # Fallback: draw colored circle
+        color_map = {
+            1: (200, 50, 50),   # Frag - red
+            2: (50, 200, 50),   # Proximity - green
+            3: (200, 200, 50)   # Gas - yellow
+        }
+        color = color_map.get(grenade_type, (150, 150, 150))
+        pygame.draw.circle(screen, color, (int(x), int(y)), 5)
+    
+    def draw_grenade_counter(self, screen, grenade_data, player_id, x, y, font):
+        """
+        Draw grenade inventory counter
+        
+        Args:
+            screen: pygame surface
+            grenade_data: numpy array with grenade counts
+            player_id: player ID (row index in grenade_data)
+            x, y: position to draw counter
+            font: pygame font object
+        """
+        if grenade_data is None or len(grenade_data) == 0:
+            return
+        
+        if player_id >= len(grenade_data):
+            return
+        
+        # Get player's grenade data
+        selected_type = int(grenade_data[player_id, 0])  # Column 0: selected grenade type
+        frag_count = int(grenade_data[player_id, 1])     # Column 1: frag count
+        proxy_count = int(grenade_data[player_id, 2])    # Column 2: proxy count
+        gas_count = int(grenade_data[player_id, 3])      # Column 3: gas count
+        
+        grenade_names = {
+            1: "Frag",
+            2: "Proximity",
+            3: "Gas"
+        }
+        
+        grenade_counts = {
+            1: frag_count,
+            2: proxy_count,
+            3: gas_count
+        }
+        
+        # Draw selected grenade type and count
+        selected_name = grenade_names.get(selected_type, "Grenade")
+        selected_count = grenade_counts.get(selected_type, 0)
+        
+        grenade_text = f"{selected_name}: {selected_count}"
+        
+        # Color based on count
+        color = (255, 255, 255)  # White
+        if selected_count == 0:
+            color = (255, 0, 0)  # Red if empty
+        elif selected_count <= 1:
+            color = (255, 255, 0)  # Yellow if low
+        
+        text_surface = font.render(grenade_text, True, color)
+        screen.blit(text_surface, (x, y))
+    
