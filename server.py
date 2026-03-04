@@ -312,12 +312,214 @@ class Server:
 
     def run_game(self):
         MAX_BULLET_DIST = config.MAX_BULLET_DISTANCE
+        SAW_WEAPON_ID = config.SAW_WEAPON_ID
+        SAW_LIFETIME = config.SAW_LIFETIME
+        SAW_EXPLOSION_RADIUS = config.SAW_EXPLOSION_RADIUS
+        SAW_EXPLOSION_DAMAGE = config.SAW_EXPLOSION_DAMAGE
+
+        if not hasattr(self, 'saw_bullet_timers'):
+            self.saw_bullet_timers = {}
 
         clock = pygame.time.Clock()
         while True:
             clock.tick(config.SERVER_FPS)
+            # Calculate delta_time for cooldowns
+            current_time = time.time()
+            delta_time = current_time - self.last_frame_time
+            self.last_frame_time = current_time
+            # Decrement grenade cooldowns
+            self.player_grenade_cooldown = np.maximum(0, self.player_grenade_cooldown - delta_time)
+            
+            # Update fire cooldowns
+            self.player_fire_cooldown = np.maximum(0, self.player_fire_cooldown - delta_time)
+            
+            # Update respawn cooldowns and respawn players when ready
+            for idx in range(8):
+                if self.player_respawn_cooldown[idx] > 0:
+                    self.player_respawn_cooldown[idx] -= delta_time
+                    if self.player_respawn_cooldown[idx] <= 0:
+                        self.player_respawn_cooldown[idx] = 0
+                        self.respawn(idx, delay=0)  # instant respawn after timer expires
+            
             # Tank movement: left/right using A/D keys (index 1=A, 2=D)
             horizontal_move = (self.player_inputs[:, 2] - self.player_inputs[:, 1]) * self.world_data[:8, 4]
+            # --- Grenade physics and fuse update ---
+            if not hasattr(self, 'grenade_fuse_timers'):
+                self.grenade_fuse_timers = {}
+            for g in range(48, 55):
+                if self.world_data[g, 0] == 1:
+                    # generic physics common to all grenades
+                    self.world_data[g, 1] += self.world_data[g, 4]  # x += vx
+                    self.world_data[g, 2] += self.world_data[g, 5]  # y += vy
+                    self.world_data[g, 5] += self.GRAVITY          # gravity
+                    
+                    grenade_type = int(self.world_data[g, 10])
+                    gx, gy = self.world_data[g, 1], self.world_data[g, 2]
+                    blast_radius = self.world_data[g, 6]
+                    damage = self.world_data[g, 7]
+
+                    # handle ground collision for all grenades
+                    ground_y = self.find_ground_below(gx, gy)
+                    if gy >= ground_y:
+                        self.world_data[g, 2] = ground_y
+                        self.world_data[g, 4] = 0
+                        self.world_data[g, 5] = 0
+
+                    if grenade_type == 1:      # normal timed grenade with bounce physics
+                        if g in self.grenade_fuse_timers:
+                            self.grenade_fuse_timers[g] -= 1.0 / config.SERVER_FPS
+                        
+                        # Bounce physics - check wall collisions
+                        BOUNCE_DAMPING = 0.7  # Energy loss on bounce
+                        GROUND_FRICTION = 0.95  # Friction when rolling on ground
+                        
+                        # Check horizontal wall collision
+                        if self.is_colliding_with_obstacle(gx, gy, 4):
+                            # Reverse horizontal velocity and dampen
+                            self.world_data[g, 4] *= -BOUNCE_DAMPING
+                            # Push grenade out of obstacle
+                            self.world_data[g, 1] -= self.world_data[g, 4] * 2
+                        
+                        # Check if on ground
+                        on_ground = (gy >= ground_y - 2)
+                        if on_ground:
+                            # Apply ground friction to horizontal velocity
+                            self.world_data[g, 4] *= GROUND_FRICTION
+                            # If velocity very small, stop completely
+                            if abs(self.world_data[g, 4]) < 0.5:
+                                self.world_data[g, 4] = 0
+                        
+                        # Check vertical bounce (hitting ground from above)
+                        if self.world_data[g, 5] > 0 and on_ground:
+                            # Bounce up with dampening
+                            self.world_data[g, 5] *= -BOUNCE_DAMPING
+                            # If bounce is too weak, stop bouncing
+                            if abs(self.world_data[g, 5]) < 2:
+                                self.world_data[g, 5] = 0
+                        
+                        if g in self.grenade_fuse_timers and self.grenade_fuse_timers[g] <= 0:
+                            # explode
+                            for t in range(8):
+                                if self.world_data[t, 0] == 1:
+                                    tx, ty = self.world_data[t, 1], self.world_data[t, 2]
+                                    if np.sqrt((tx - gx)**2 + (ty - gy)**2) < blast_radius:
+                                        distance = np.sqrt((tx - gx)**2 + (ty - gy)**2)
+                                        self.world_data[t, 7] -= self.grenade_damage(distance, max_damage=damage, radius=blast_radius)
+                                        if self.world_data[t, 7] <= 0:
+                                            self.respawn(t, delay=0)
+                            self.world_data[g, 0] = 0
+                            del self.grenade_fuse_timers[g]
+
+                    elif grenade_type == 2:  # proxy grenade – arms after delay then explodes on contact
+                        # decrement whichever timer is active (arming or lifetime)
+                        if g in self.grenade_fuse_timers:
+                            self.grenade_fuse_timers[g] -= 1.0 / config.SERVER_FPS
+                        # ensure armed-state tracking exists
+                        if not hasattr(self, 'proxy_armed'):
+                            self.proxy_armed = set()
+
+                        if g in self.proxy_armed:
+                            # already armed – timer now represents remaining life
+                            if self.grenade_fuse_timers.get(g, 0) <= 0:
+                                # lifetime expired without contact, just remove
+                                self.world_data[g, 0] = 0
+                                self.proxy_armed.discard(g)
+                                self.grenade_fuse_timers.pop(g, None)
+                            else:
+                                # check for player contact and detonate if seen
+                                detonated = False
+                                for t in range(8):
+                                    if self.world_data[t, 0] == 1:
+                                        tx, ty = self.world_data[t, 1], self.world_data[t, 2]
+                                        if np.sqrt((tx - gx)**2 + (ty - gy)**2) < blast_radius/3:
+                                            detonated = True
+                                            break
+                                if detonated:
+                                    for t in range(8):
+                                        if self.world_data[t, 0] == 1:
+                                            tx, ty = self.world_data[t, 1], self.world_data[t, 2]
+                                            distance = np.sqrt((tx - gx)**2 + (ty - gy)**2)
+                                            if distance < blast_radius:
+                                                self.world_data[t, 7] -= self.grenade_damage(distance, max_damage=damage, radius=blast_radius)
+                                                if self.world_data[t, 7] <= 0:
+                                                    self.respawn(t, delay=0)
+                                    self.world_data[g, 0] = 0
+                                    self.proxy_armed.discard(g)
+                                    self.grenade_fuse_timers.pop(g, None)
+                        else:
+                            # still in arming phase
+                            if g in self.grenade_fuse_timers and self.grenade_fuse_timers[g] <= 0:
+                                # move into armed state with 45‑second lifetime
+                                self.proxy_armed.add(g)
+                                self.grenade_fuse_timers[g] = 45.0
+                    elif grenade_type == 3:  # gas grenade - creates persistent damage zone
+                        # Apply same bounce/rolling physics as frag grenade
+                        BOUNCE_DAMPING = 0.7
+                        GROUND_FRICTION = 0.95
+
+                        # Check horizontal wall collision
+                        if self.is_colliding_with_obstacle(gx, gy, 4):
+                            self.world_data[g, 4] *= -BOUNCE_DAMPING
+                            self.world_data[g, 1] -= self.world_data[g, 4] * 2
+
+                        # Check if on ground
+                        on_ground = (gy >= ground_y - 2)
+                        if on_ground:
+                            self.world_data[g, 4] *= GROUND_FRICTION
+                            if abs(self.world_data[g, 4]) < 0.5:
+                                self.world_data[g, 4] = 0
+
+                        # Check vertical bounce
+                        if self.world_data[g, 5] > 0 and on_ground:
+                            self.world_data[g, 5] *= -BOUNCE_DAMPING
+                            if abs(self.world_data[g, 5]) < 2:
+                                self.world_data[g, 5] = 0
+
+                        if g in self.grenade_fuse_timers:
+                            self.grenade_fuse_timers[g] -= 1.0 / config.SERVER_FPS
+                            if self.grenade_fuse_timers[g] <= 0:
+                                # Create persistent gas effect zone
+                                effect_id = self.gas_effect_counter
+                                self.gas_effect_counter += 1
+                                self.gas_effects[effect_id] = {
+                                    'x': gx,
+                                    'y': gy,
+                                    'radius': blast_radius,
+                                    'damage': damage,
+                                    'duration': 12.0,
+                                    'owner_id': int(self.world_data[g, 9]),
+                                    'source_slot': g
+                                }
+                                print(f"[SERVER] Gas effect created at ({gx:.1f}, {gy:.1f}) with radius {blast_radius}, damage {damage}/frame")
+                                self.world_data[g, 0] = 0
+                                del self.grenade_fuse_timers[g]
+            
+            # --- Process active gas effects ---
+            effects_to_remove = []
+            for effect_id, effect in self.gas_effects.items():
+                # Decrement gas duration
+                effect['duration'] -= 1.0 / config.SERVER_FPS
+                
+                # Apply damage to players in the gas zone
+                for t in range(8):
+                    if self.world_data[t, 0] == 1:
+                        tx, ty = self.world_data[t, 1], self.world_data[t, 2]
+                        distance = np.sqrt((tx - effect['x'])**2 + (ty - effect['y'])**2)
+                        if distance < effect['radius']:
+                            self.world_data[t, 7] -= (effect['damage']/distance)
+                            
+                            # Check if player died
+                            if self.world_data[t, 7] <= 0:
+                                print(f"[SERVER] Player {t} killed by gas grenade")
+                                self.respawn(t, delay=0)
+                
+                # Remove effect if duration expired
+                if effect['duration'] <= 0:
+                    effects_to_remove.append(effect_id)
+            
+            # Clean up expired gas effects
+            for effect_id in effects_to_remove:
+                del self.gas_effects[effect_id]
             
             # Check horizontal collisions before moving - allow movement away from obstacles
             for i in range(8):
@@ -433,46 +635,137 @@ class Server:
             # Move bullets and check collisions
             for b in range(8, 48):
                 if self.world_data[b, 0] == 1:  # if bullet is active
-                    # Store old position
+                    bullet_weapon_id = int(self.world_data[b, 10])
                     old_x, old_y = self.world_data[b, 1], self.world_data[b, 2]
-                    
-                    # Move bullet
                     self.world_data[b, 1] += np.cos(self.world_data[b, 3]) * self.world_data[b, 4]
                     self.world_data[b, 2] += np.sin(self.world_data[b, 3]) * self.world_data[b, 4]
-                    
-                    # Update distance traveled
                     self.world_data[b, 5] += self.world_data[b, 4]
-                    
-                    # Check if bullet hit obstacle along its path
-                    # Always check, even on first movement, to prevent bullets spawning through walls
-                    new_x, new_y = self.world_data[b, 1], self.world_data[b, 2]
-                    
-                    # Check multiple points along the path - more steps for faster bullets
-                    # Calculate dynamic step count based on bullet speed to ensure no gaps
-                    bullet_speed = self.world_data[b, 4]
-                    min_steps = max(10, int(bullet_speed / 2))  # At least 10 steps, more for faster bullets
-                    
-                    hit_obstacle = False
-                    for i in range(min_steps + 1):
-                        t = i / min_steps
-                        check_x = old_x + (new_x - old_x) * t
-                        check_y = old_y + (new_y - old_y) * t
-                        if self.is_colliding_with_obstacle(check_x, check_y, 3):  # Slightly larger radius for better detection
-                            hit_obstacle = True
-                            break
-                    
-                    if hit_obstacle:
-                        self.world_data[b, 0] = 0  # deactivate bullet
 
-            # Deactivate bullets that traveled too far
-            self.world_data[8:, 0] = np.where(self.world_data[8:, 5] > MAX_BULLET_DIST, 0, self.world_data[8:, 0])
+                    if self.world_data[b, 5] > self.world_data[b, 4]:
+                        new_x, new_y = self.world_data[b, 1], self.world_data[b, 2]
 
-            # Update fire cooldowns with delta time
-            current_time = time.time()
-            delta_time = current_time - self.last_frame_time
-            self.last_frame_time = current_time
-            self.player_fire_cooldown = np.maximum(0, self.player_fire_cooldown - delta_time)
-            
+                        # sample along path to detect obstacle hit
+                        steps = 5
+                        hit = False
+                        for i in range(steps + 1):
+                            t = i / steps
+                            check_x = old_x + (new_x - old_x) * t
+                            check_y = old_y + (new_y - old_y) * t
+                            if self.is_colliding_with_obstacle(check_x, check_y, 2):
+                                hit = True
+                                break
+                        if hit:
+                            if bullet_weapon_id == SAW_WEAPON_ID:
+                                # Mirror-like reflection: preserve speed, reflect angle by hit axis.
+                                hit_x = self.is_colliding_with_obstacle(new_x, old_y, 2)
+                                hit_y = self.is_colliding_with_obstacle(old_x, new_y, 2)
+
+                                if hit_x and not hit_y:
+                                    self.world_data[b, 3] = np.pi - self.world_data[b, 3]
+                                elif hit_y and not hit_x:
+                                    self.world_data[b, 3] = -self.world_data[b, 3]
+                                else:
+                                    self.world_data[b, 3] += np.pi
+
+                                self.world_data[b, 1] = old_x + np.cos(self.world_data[b, 3]) * self.world_data[b, 4]
+                                self.world_data[b, 2] = old_y + np.sin(self.world_data[b, 3]) * self.world_data[b, 4]
+                            else:
+                                self.world_data[b, 0] = 0
+
+                    if bullet_weapon_id == SAW_WEAPON_ID:
+                        if b not in self.saw_bullet_timers:
+                            self.saw_bullet_timers[b] = SAW_LIFETIME
+                        self.saw_bullet_timers[b] -= 1.0 / config.SERVER_FPS
+                        if self.saw_bullet_timers[b] <= 0:
+                            sx, sy = self.world_data[b, 1], self.world_data[b, 2]
+                            owner = int(self.world_data[b, 9])
+                            for t in range(8):
+                                if self.world_data[t, 0] == 0:
+                                    continue
+                                tx, ty = self.world_data[t, 1], self.world_data[t, 2]
+                                distance = np.sqrt((tx - sx)**2 + (ty - sy)**2)
+                                if distance < SAW_EXPLOSION_RADIUS:
+                                    self.world_data[t, 7] -= self.grenade_damage(
+                                        distance,
+                                        max_damage=SAW_EXPLOSION_DAMAGE,
+                                        radius=SAW_EXPLOSION_RADIUS
+                                    )
+                                    if self.world_data[t, 7] <= 0:
+                                        if 0 <= owner < 8:
+                                            self.world_data[owner, 8] += 1
+                                        self.respawn(t, delay=0)
+                            self.world_data[b, 0] = 0
+                            self.saw_bullet_timers.pop(b, None)
+                    else:
+                        self.saw_bullet_timers.pop(b, None)
+                    if bullet_weapon_id == config.ROCKET_LAUNCHER_ID:
+                        #explodes on any collision player or wall, so check walls first then player collisions
+                        sx, sy = self.world_data[b, 1], self.world_data[b, 2]
+                        owner = int(self.world_data[b, 9])
+                        
+                        # Check for wall collision along path
+                        steps = 5
+                        wall_hit = False
+                        player_hit = False
+                        for i in range(steps + 1):
+                            sample_t = i / steps
+                            check_x = old_x + (new_x - old_x) * sample_t
+                            check_y = old_y + (new_y - old_y) * sample_t
+                            if self.is_colliding_with_obstacle(check_x, check_y, 2):
+                                wall_hit = True
+                                sx, sy = check_x, check_y
+                                break
+
+                            # Trigger on collision with other players only (owner contact should not trigger).
+                            for player_idx in range(8):
+                                if self.world_data[player_idx, 0] == 0:
+                                    continue
+                                if player_idx == owner:
+                                    continue
+                                tx, ty = self.world_data[player_idx, 1], self.world_data[player_idx, 2]
+                                distance = np.sqrt((tx - check_x)**2 + (ty - check_y)**2)
+                                if distance < config.BULLET_HIT_RADIUS:
+                                    player_hit = True
+                                    sx, sy = check_x, check_y
+                                    break
+                            if player_hit:
+                                break
+                        # Apply AoE explosion damage
+                        if wall_hit or player_hit:
+                            for t in range(8):
+                                if self.world_data[t, 0] == 0:
+                                    continue
+                                tx, ty = self.world_data[t, 1], self.world_data[t, 2]
+                                distance = np.sqrt((tx - sx)**2 + (ty - sy)**2)
+                                if distance < config.ROCKET_EXPLOSION_RADIUS:
+                                    self.world_data[t, 7] -= self.grenade_damage(
+                                        distance,
+                                        max_damage=config.ROCKET_EXPLOSION_DAMAGE,
+                                        radius=config.ROCKET_EXPLOSION_RADIUS
+                                    )
+                                    if self.world_data[t, 7] <= 0:
+                                        if 0 <= owner < 8:
+                                            self.world_data[owner, 8] += 1
+                                        self.respawn(t, delay=0)
+                        
+                        # Deactivate rocket if it hit something
+                        if wall_hit or player_hit:
+                            self.world_data[b, 0] = 0
+
+            # Deactivate bullets that traveled too far (bullet slots only: 8-47)
+            bullet_distances = self.world_data[8:48, 5]
+            bullet_active = self.world_data[8:48, 0]
+            bullet_weapon_ids = self.world_data[8:48, 10].astype(np.int32)
+            non_saw_mask = bullet_weapon_ids != SAW_WEAPON_ID
+            too_far_mask = bullet_distances > MAX_BULLET_DIST
+            deactivate_mask = non_saw_mask & too_far_mask
+            self.world_data[8:48, 0] = np.where(deactivate_mask, 0, bullet_active)
+
+            # Cleanup timers for any saw bullets that were deactivated this frame.
+            for b in list(self.saw_bullet_timers.keys()):
+                if self.world_data[b, 0] == 0:
+                    self.saw_bullet_timers.pop(b, None)
+
             # Update gun spawner
             self.gun_spawner.update(delta_time)
             
@@ -574,52 +867,50 @@ class Server:
 
             # detect collisions
             # BULLET -> TANK collisions: apply damage, credit score, respawn on death
-            # Use interpolated path checking to prevent bullets from skipping over players
             for b in range(8, 48):
                 if self.world_data[b, 0] == 0:
                     continue
+                bullet_weapon_id = int(self.world_data[b, 10])
+                # bullet position
+                bx, by = self.world_data[b, 1], self.world_data[b, 2]
                 
-                # Get bullet old and new positions
-                old_bx, old_by = bullet_old_positions[b-8, 0], bullet_old_positions[b-8, 1]
-                new_bx, new_by = self.world_data[b, 1], self.world_data[b, 2]
-                damage = self.world_data[b, 7]
+                if bullet_weapon_id in WEAPONS:
+                    damage = WEAPONS[bullet_weapon_id].damage
+                else:
+                    damage = self.world_data[b, 7]
                 owner = int(self.world_data[b, 9])
                 
                 bullet_hit = False
-                # Check collision along the bullet's path with multiple interpolation steps
-                # Increase steps for more accurate detection with fast bullets
-                bullet_speed = self.world_data[b, 4]
-                steps = max(15, int(bullet_speed / 1.5))  # Dynamic steps based on speed
-                for step in range(steps + 1):
-                    if bullet_hit:
-                        break
-                    
-                    # Interpolate position along bullet path
-                    t = step / steps
-                    bx = old_bx + (new_bx - old_bx) * t
-                    by = old_by + (new_by - old_by) * t
-                    
-                    # Check against all players
-                    for tank in range(8):
-                        if self.world_data[tank, 0] == 0:
+                for t in range(8):
+                    if self.world_data[t, 0] == 0:
+                        continue
+                    if t == owner and bullet_weapon_id != SAW_WEAPON_ID:
+                        continue
+                    if (
+                        bullet_weapon_id == SAW_WEAPON_ID
+                        and t == owner
+                        and self.world_data[b, 5] < config.SAW_SELF_HIT_ARM_DISTANCE
+                    ):
+                        # Prevent instant self-kill right at launch.
+                        continue
+                    tx, ty = self.world_data[t, 1], self.world_data[t, 2]
+                    dist = np.sqrt((tx - bx)**2 + (ty - by)**2)
+                    if dist < config.BULLET_HIT_RADIUS:
+                        if bullet_weapon_id == SAW_WEAPON_ID:
+                            # Saw projectile pierces and kills everything it touches.
+                            self.world_data[t, 7] = 0
+                            if 0 <= owner < 8:
+                                self.world_data[owner, 8] += 1
+                            self.respawn(t, delay=0)
                             continue
-                        if tank == owner:
-                            continue
-                        
-                        tx, ty = self.world_data[tank, 1], self.world_data[tank, 2]
-                        dist = np.sqrt((tx - bx)**2 + (ty - by)**2)
-                        
-                        if dist < config.BULLET_HIT_RADIUS:
-                            # hit - apply damage
-                            self.world_data[tank, 7] -= damage
+                        else:
+                            # Normal hit - apply damage once and consume bullet.
+                            self.world_data[t, 7] -= damage
                             bullet_hit = True
-                            
-                            # check death
-                            if self.world_data[tank, 7] <= 0:
-                                # credit score to owner if owner is valid
+                            if self.world_data[t, 7] <= 0:
                                 if 0 <= owner < 8:
                                     self.world_data[owner, 8] += 1
-                                self.respawn(tank)
+                                self.respawn(t, delay=0)
                             break
                 
                 # remove bullet after processing all potential hits
@@ -633,16 +924,48 @@ class Server:
                     self.world_data[i, 9] = current_gun.current_ammo
                     self.world_data[i, 10] = current_gun.total_ammo
             
+            # Handle grenade type cycling (C key = input 11) on rising edge
+            for idx in range(8):
+                if self.world_data[idx, 0] == 0:
+                    continue
+                if self.player_inputs[idx, 11] == 1 and self.previous_inputs[idx, 11] == 0:
+                    if self.grenade_data[idx, 0] == 3:
+                        self.grenade_data[idx, 0] = 1
+                    else:
+                        self.grenade_data[idx, 0] += 1
+            
+            # Handle grenade throws (G key = input 10)
+            for idx in range(8):
+                if self.world_data[idx, 0] == 0:
+                    continue
+                # Check for grenade throw input (G key = index 10)
+                if self.player_inputs[idx, 10] == 1 and self.player_grenade_cooldown[idx] <= 0:
+                    throw_angle = self.world_data[idx, 3]
+                    throw_power = 15  # Adjust as needed
+                    grenade_id = int(self.grenade_data[idx, 0])  # Get grenade type from grenade_data array
+                    if self.grenade_data[idx, grenade_id] <= 0:
+                        continue  # No grenades of this type available
+                    self.grenade_data[idx, grenade_id] -= 1
+                    self.throw_grenade(idx, grenade_id, throw_angle, throw_power)
+                    self.player_grenade_cooldown[idx] = 2.0  # 2 seconds cooldown
+
             # Store current inputs for next frame's edge detection
             self.previous_inputs = self.player_inputs.copy()
 
-    def respawn(self, tank_index):
+    def respawn(self, tank_index, delay=0.0):
         # spawn at a random x and find ground below
+        # Non-blocking respawn: set timer instead of sleeping
+        if delay > 0:
+            self.player_respawn_cooldown[tank_index] = delay
+            self.world_data[tank_index, 0] = 0  # mark as dead during respawn delay
+            return
+        
         spawn_x = np.random.randint(self.TANK_RADIUS, self.SCREEN_W - self.TANK_RADIUS)
         # Start from top and find first valid ground
         ground_y = self.find_ground_below(spawn_x, 0)
         self.world_data[tank_index, 1] = spawn_x
         self.world_data[tank_index, 2] = ground_y
+        self.world_data[tank_index, 0] = 1  # mark as alive
         # reset vertical velocity
         if hasattr(self, 'player_vy'):
             self.player_vy[tank_index] = 0
@@ -689,7 +1012,7 @@ class Server:
         conn.send(self.collision_map_bytes)
         
         self.world_data[player_id, 0] = 1
-        self.respawn(player_id)
+        self.respawn(player_id, delay=0)  # instant spawn when joining game
 
         while True:
             data = conn.recv(16)  # allow for up to 16 bytes (12 bools = 12 bytes, but allow extra)

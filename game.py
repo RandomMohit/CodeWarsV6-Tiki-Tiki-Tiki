@@ -4,7 +4,7 @@ import importlib
 import numpy as np
 from client import Network
 import time
-from weapons import WEAPONS
+from weapons import WEAPONS, get_grenade
 from weapon_renderer import WeaponRenderer
 from weapon_effects import WeaponEffectsManager
 import config
@@ -149,9 +149,9 @@ class PlayerClient:
                 )
                 keyboard_input = self.input_provider.get_action()
             else:
-                keyboard_input = np.zeros(10, dtype=bool)
+                keyboard_input = np.zeros(12, dtype=bool)
                 keys = pygame.key.get_pressed()
-                # keyboard mapping...
+                # [W=jetpack, A=left, D=right, UP=aim up, DOWN=aim down, LEFT=aim left, RIGHT=aim right, SPACE=shoot, R=reload, S=switch gun, G=grenade, C=change grenade type]
 
                 if keys[pygame.K_w]: keyboard_input[0] = 1
                 if keys[pygame.K_a]: keyboard_input[1] = 1
@@ -163,6 +163,8 @@ class PlayerClient:
                 if keys[pygame.K_SPACE]: keyboard_input[7] = 1
                 if keys[pygame.K_r]: keyboard_input[8] = 1
                 if keys[pygame.K_s]: keyboard_input[9] = 1
+                if keys[pygame.K_g]: keyboard_input[10] = 1
+                if keys[pygame.K_c]: keyboard_input[11] = 1
           
             # Update player weapons from inventory data
             if self.render_enabled and inventory_data is not None:
@@ -228,9 +230,9 @@ class PlayerClient:
                 self.prev_bullets = active_bullets
             
             if self.render_enabled:
-                self.render(game_world, gun_spawns)
+                self.render(game_world, gun_spawns, gas_data, grenade_data)
 
-    def render(self, game_world, gun_spawns):
+    def render(self, game_world, gun_spawns, gas_data, grenade_data):
         # Brown background (open space)
         self.screen.fill(config.BACKGROUND_COLOR)
         
@@ -378,6 +380,8 @@ class PlayerClient:
             weapon_name_surf = self.font.render(weapon.name, True, (255, 255, 255))
             self.screen.blit(weapon_name_surf, (10, 70))
             self.weapon_renderer.draw_ammo_counter(self.screen, weapon, 10, 95, self.font)
+            # Draw grenade counter
+            self.weapon_renderer.draw_grenade_counter(self.screen, grenade_data, self.ID, 10, 120, self.font)
         
         # Draw bullets with trails (Mini Militia style)
         for i in range(8, 48):
@@ -408,6 +412,38 @@ class PlayerClient:
                 # Fallback: draw circle with glow
                 pygame.draw.circle(self.screen, (255, 255, 150), (bx, by), 3)
                 pygame.draw.circle(self.screen, (255, 255, 255), (bx, by), 2)
+
+        # Draw grenades (rows 48-54 in world_data)
+        for i in range(48, 55):
+            if game_world[i, 0] == 1:
+                gx = int(game_world[i, 1])  # x position
+                gy = int(game_world[i, 2])  # y position
+                grenade_id = int(game_world[i, 10])  # grenade type ID
+
+                # Get grenade definition to access sprite file
+                grenade = get_grenade(grenade_id)
+                sprite_file = grenade.sprite_file if grenade else None
+
+                self.weapon_renderer.draw_grenade(
+                    self.screen,
+                    gx,
+                    gy,
+                    grenade_type=grenade_id,
+                    sprite_file=sprite_file,
+                    is_armed=False  # Armed state not transmitted to client yet
+                )
+
+        # Draw gas effects (visual indicator for gas zones)
+        for effect in gas_data:
+            if len(effect) >= 4:
+                ex, ey, radius, duration = effect
+                if duration > 0:
+                    # Draw semi-transparent green circle for gas
+                    gas_surface = pygame.Surface((int(radius * 2), int(radius * 2)), pygame.SRCALPHA)
+                    pygame.draw.circle(gas_surface, (0, 255, 0, 50), (int(radius), int(radius)), int(radius))
+                    self.screen.blit(gas_surface, (int(ex - radius), int(ey - radius)))
+                    # Draw border
+                    pygame.draw.circle(self.screen, (0, 200, 0, 150), (int(ex), int(ey)), int(radius), 2)
 
         # Draw visual effects (muzzle flashes and impacts)
         self.effects_manager.draw(self.screen)
