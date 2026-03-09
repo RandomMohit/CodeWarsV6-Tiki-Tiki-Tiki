@@ -80,7 +80,7 @@ BULLET_VISUAL_RADIUS = 5
 WEAPON_STATS = {
     0: {
         "name": "AK47",
-        "damage": 10,
+        "damage": 20,
         "accuracy": 4,
         "reload_time": 2.5,
         "melee": 30,
@@ -140,7 +140,7 @@ WEAPON_STATS = {
     },
     4: {
         "name": "M4",
-        "damage": 14,
+        "damage": 17,
         "accuracy": 2,
         "reload_time": 2.5,
         "melee": 30,
@@ -155,7 +155,7 @@ WEAPON_STATS = {
     },
     5: {
         "name": "M93BA Sniper",
-        "damage": 75,
+        "damage": 200,
         "accuracy": 0,
         "reload_time": 3.5,
         "melee": 35,
@@ -230,7 +230,7 @@ WEAPON_STATS = {
     },
     10: {
         "name": "SPAS-12",
-        "damage": 25,
+        "damage": 50,
         "accuracy": 10,
         "reload_time": 3.5,
         "melee": 40,
@@ -432,6 +432,7 @@ SAW_SELF_HIT_ARM_DISTANCE = 35.0    # Must travel this far before it can hurt th
 
 RESPAWN_WITH_FULL_FUEL = True
 RESPAWN_WITH_FULL_HEALTH = True
+RESPAWN_DELAY = 5.0  # Seconds to wait before respawning after death
 
 # Rocket Launcher settings
 ROCKET_LAUNCHER_ID = 15

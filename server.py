@@ -150,6 +150,7 @@ class Server:
 
         # Health and score per tank
         self.MAX_HEALTH = config.MAX_HEALTH
+        self.RESPAWN_DELAY = getattr(config, 'RESPAWN_DELAY', 5.0)
         self.world_data[:8, 7] = self.MAX_HEALTH  # health
         self.world_data[:8, 8] = 0.0  # score
 
@@ -231,7 +232,8 @@ class Server:
 
         for _ in range(64):
             spawn_x = float(np.random.randint(min_x, max_x + 1))
-            spawn_y = float(self.find_ground_below(spawn_x, 0))
+            ground_y = self.find_ground_below(spawn_x, 0)
+            spawn_y = float(self.GROUND_Y if ground_y is None else ground_y)
             spawn_y = float(np.clip(spawn_y, self.TANK_RADIUS, self.SCREEN_H - self.COLLISION_RADIUS))
             if not self.is_colliding_with_obstacle(spawn_x, spawn_y, self.COLLISION_RADIUS):
                 return spawn_x, spawn_y
@@ -325,9 +327,9 @@ class Server:
         vx = self.world_data[grenade_slot, 4]
         vy = self.world_data[grenade_slot, 5] + self.GRAVITY
 
-        wall_bounce = 0.15
-        floor_bounce = 0.15
-        roll_friction = 0.92
+        wall_bounce = 0.10
+        floor_bounce = 0.10
+        roll_friction = 0.95
 
         speed = max(abs(vx), abs(vy), 1.0)
         steps = min(8, max(1, int(np.ceil(speed / 4.0))))
@@ -420,12 +422,12 @@ class Server:
         self.world_data[grenade_slot, 5] = vy
     
     def find_ground_below(self, x, y):
-        """Find the y-coordinate of the first obstacle below position (x, y)"""
+        """Find the y-coordinate of the first obstacle below position (x, y)."""
         grid_x = int(x / self.GRID_SIZE)
         start_grid_y = int(y / self.GRID_SIZE)
         
         if grid_x < 0 or grid_x >= self.GRID_W:
-            return self.GROUND_Y
+            return None
         
         # If player is above screen, start search from top
         if start_grid_y < 0:
@@ -437,7 +439,7 @@ class Server:
                 # Found obstacle, return top of this cell minus collision radius
                 return gy * self.GRID_SIZE - self.COLLISION_RADIUS
         
-        return self.GROUND_Y
+        return None
     
     def _get_barrel_distance(self, weapon_id):
         """Get distance from player center to gun barrel tip for bullet spawning"""
@@ -550,7 +552,7 @@ class Server:
                                         distance = np.sqrt((tx - gx)**2 + (ty - gy)**2)
                                         self.world_data[t, 7] -= self.grenade_damage(distance, max_damage=damage, radius=blast_radius)
                                         if self.world_data[t, 7] <= 0:
-                                            self.respawn(t, delay=0)
+                                            self.respawn(t, delay=self.RESPAWN_DELAY)
                             self.world_data[g, 0] = 0
                             del self.grenade_fuse_timers[g]
                             if hasattr(self, 'grenade_stuck_frames'):
@@ -590,7 +592,7 @@ class Server:
                                             if distance < blast_radius:
                                                 self.world_data[t, 7] -= self.grenade_damage(distance, max_damage=damage, radius=blast_radius)
                                                 if self.world_data[t, 7] <= 0:
-                                                    self.respawn(t, delay=0)
+                                                    self.respawn(t, delay=self.RESPAWN_DELAY)
                                     self.world_data[g, 0] = 0
                                     self.proxy_armed.discard(g)
                                     self.grenade_fuse_timers.pop(g, None)
@@ -641,7 +643,7 @@ class Server:
                             # Check if player died
                             if self.world_data[t, 7] <= 0:
                                 print(f"[SERVER] Player {t} killed by gas grenade")
-                                self.respawn(t, delay=0)
+                                self.respawn(t, delay=self.RESPAWN_DELAY)
                 
                 # Remove effect if duration expired
                 if effect['duration'] <= 0:
@@ -733,7 +735,7 @@ class Server:
                 # Check collision with obstacles below
                 if self.player_vy[i] > 0:  # falling down
                     ground_y = self.find_ground_below(self.world_data[i, 1], old_y)
-                    if new_y >= ground_y:
+                    if ground_y is not None and new_y >= ground_y:
                         self.world_data[i, 2] = ground_y
                         self.player_vy[i] = 0
                     else:
@@ -751,8 +753,17 @@ class Server:
             
             # clamp horizontal position to screen
             self.world_data[:8, 1] = np.clip(self.world_data[:8, 1], self.TANK_RADIUS, self.SCREEN_W - self.TANK_RADIUS)
-            # clamp vertical position to prevent going too far up
-            self.world_data[:8, 2] = np.clip(self.world_data[:8, 2], self.TANK_RADIUS, self.SCREEN_H - self.COLLISION_RADIUS)
+            # clamp vertical position only at top; bottom is handled by fall death.
+            self.world_data[:8, 2] = np.maximum(self.world_data[:8, 2], self.TANK_RADIUS)
+
+            # Players that fall out below the map die and immediately respawn.
+            fall_kill_y = self.SCREEN_H + self.COLLISION_RADIUS
+            for i in range(8):
+                if self.world_data[i, 0] == 0:
+                    continue
+                if self.world_data[i, 2] > fall_kill_y:
+                    self.world_data[i, 7] = 0
+                    self.respawn(i, delay=self.RESPAWN_DELAY)
 
             # Resolve any tank that is still embedded in terrain.
             for i in range(8):
@@ -853,7 +864,7 @@ class Server:
                                     if self.world_data[t, 7] <= 0:
                                         if 0 <= owner < 8:
                                             self.world_data[owner, 8] += 1
-                                        self.respawn(t, delay=0)
+                                        self.respawn(t, delay=self.RESPAWN_DELAY)
                             self.world_data[b, 0] = 0
                             self.saw_bullet_timers.pop(b, None)
                     else:
@@ -906,7 +917,7 @@ class Server:
                                     if self.world_data[t, 7] <= 0:
                                         if 0 <= owner < 8:
                                             self.world_data[owner, 8] += 1
-                                        self.respawn(t, delay=0)
+                                        self.respawn(t, delay=self.RESPAWN_DELAY)
                         
                         # Deactivate rocket if it hit something
                         if wall_hit or player_hit:
@@ -952,6 +963,8 @@ class Server:
             # create bullets (space = index 7)
             shooting_id = np.where(self.player_inputs[:, 7] == 1)[0]
             for idx in shooting_id:
+                if self.world_data[idx, 0] != 1:
+                    continue
                 weapon = self.player_inventories[idx].get_current_gun()
                 
                 if weapon is None:
@@ -1067,7 +1080,7 @@ class Server:
                             self.world_data[t, 7] = 0
                             if 0 <= owner < 8:
                                 self.world_data[owner, 8] += 1
-                            self.respawn(t, delay=0)
+                            self.respawn(t, delay=self.RESPAWN_DELAY)
                             continue
                         else:
                             # Normal hit - apply damage once and consume bullet.
@@ -1076,7 +1089,7 @@ class Server:
                             if self.world_data[t, 7] <= 0:
                                 if 0 <= owner < 8:
                                     self.world_data[owner, 8] += 1
-                                self.respawn(t, delay=0)
+                                self.respawn(t, delay=self.RESPAWN_DELAY)
                             break
                 
                 # remove bullet after processing all potential hits
