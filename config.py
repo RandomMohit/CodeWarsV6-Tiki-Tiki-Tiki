@@ -56,7 +56,6 @@ BOT_SCRIPTS = [
     "random_bot",
     "pro_bot",
     "debug_bot"
-    "probotchanged"
 ]
 
 # If no keyboard player, first script bot renders
