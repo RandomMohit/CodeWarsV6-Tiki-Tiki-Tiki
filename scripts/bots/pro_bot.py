@@ -120,40 +120,21 @@ def run(state, memory):
 
     if enemies:
         # Target the closest enemy.
+        target = min(enemies, key=lambda e: e["distance"])
+        target_id = int(target["id"])
+        ex = float(target["x"])
+        ey = float(target["y"])
+        target_health = float(target["health"])
+        distance = float(target["distance"])
 
-        # Sort enemies by distance (closest first)
-        sorted_enemies = sorted(enemies, key=lambda e: float(e["distance"]))
+        # Precise direction vector and angle to target.
+        dx = ex - my_x
+        dy = ey - my_y
+        angle = math.atan2(dy, dx)
 
-        i = 0
-        target = None
-
-        while i < len(sorted_enemies):
-            candidate = sorted_enemies[i]
-
-            ex = float(candidate["x"])
-            ey = float(candidate["y"])
-            distance = float(candidate["distance"])
-
-            dx = ex - my_x
-            dy = ey - my_y
-            angle = math.atan2(dy, dx)
-
-            obstacle_dist = state.distance_to_obstacle(angle, max_distance=2000.0, step=4.0)
-            blocked = obstacle_dist < max(0.0, distance - 20.0)
-
-            if not blocked:
-                target = candidate
-                break
-
-            i += 1
-
-        # If a valid target is found
-        if target:
-            target_id = int(target["id"])
-            ex = float(target["x"])
-            ey = float(target["y"])
-            target_health = float(target["health"])
-            distance = float(target["distance"])
+        # Line-of-sight: blocked if an obstacle is closer than the target.
+        obstacle_dist = state.distance_to_obstacle(angle, max_distance=2000.0, step=4.0)
+        blocked = obstacle_dist < max(0.0, distance - 20.0)
 
         # Aim error normalized to [-pi, pi].
         aim_error = angle - current_aim
