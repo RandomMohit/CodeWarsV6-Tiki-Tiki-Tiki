@@ -92,7 +92,7 @@ class Server:
         SERVER_IP = socket.gethostbyname(HOST_NAME)
 
         try:
-            self.server_socket.bind((SERVER_IP, PORT))
+            self.server_socket.bind(("0.0.0.0", PORT))
         except socket.error as e:
             print(str(e))
             print("[SERVER] Server could not start")
